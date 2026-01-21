@@ -1,0 +1,14 @@
+Woodpecker CI is a simple, yet powerful CI/CD engine with great extensibility.
+It is a community fork of Drone CI.
+
+This package provides the Woodpecker server, which is the central component
+that manages:
+
+- Repository configuration and webhooks
+- Build pipeline scheduling and orchestration
+- Web UI for monitoring builds
+- API for programmatic access
+- Agent coordination and workload distribution
+
+The server supports multiple database backends including SQLite (default),
+PostgreSQL, and MySQL.

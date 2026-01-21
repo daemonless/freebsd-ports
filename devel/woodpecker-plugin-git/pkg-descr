@@ -1,0 +1,11 @@
+plugin-git is the default git clone plugin for Woodpecker CI.
+
+It handles cloning repositories at the start of a pipeline. When using
+the local backend on FreeBSD, this binary must be in the PATH for the
+automatic clone step to work.
+
+Features:
+- Git clone with configurable depth
+- Branch/tag/commit checkout
+- Submodule support
+- Partial clone support

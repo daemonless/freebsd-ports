@@ -1,0 +1,19 @@
+# Woodpecker Agent Configuration
+# %%ETCDIR%%/agent.conf
+#
+# Documentation: https://woodpecker-ci.org/docs/administration/agent-config
+
+# Server connection (use IP address, not "localhost" if strict)
+WOODPECKER_SERVER=127.0.0.1:9000
+
+# Shared secret with server
+WOODPECKER_AGENT_SECRET=your-secret-here
+
+# Backend: local, docker, kubernetes
+WOODPECKER_BACKEND=local
+
+# Log level: trace, debug, info, warn, error
+WOODPECKER_LOG_LEVEL=info
+
+# Agent hostname shown in UI
+WOODPECKER_HOSTNAME=my-agent

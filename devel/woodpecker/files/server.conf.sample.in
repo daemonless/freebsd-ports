@@ -1,0 +1,26 @@
+# Woodpecker Server Configuration
+# %%ETCDIR%%/server.conf
+#
+# Documentation: https://woodpecker-ci.org/docs/administration/server-config
+
+# Public URL of the server (required for webhooks)
+WOODPECKER_HOST=http://localhost:8000
+
+# HTTP server address
+WOODPECKER_SERVER_ADDR=:8000
+
+# gRPC server address for agent connections
+WOODPECKER_GRPC_ADDR=:9000
+
+# Shared secret with agents (generate with: openssl rand -hex 32)
+WOODPECKER_AGENT_SECRET=your-secret-here
+
+# Database configuration
+WOODPECKER_DATABASE_DRIVER=sqlite3
+WOODPECKER_DATABASE_DATASOURCE=%%WOODPECKER_DB_DIR%%/woodpecker.sqlite
+
+# Log level: trace, debug, info, warn, error
+WOODPECKER_LOG_LEVEL=info
+
+# Allow open registration (true/false)
+WOODPECKER_OPEN=false

@@ -1,0 +1,5 @@
+TIMESTAMP = 1768759075
+SHA256 (go/devel_woodpecker-server/woodpecker-server-v3.13.0/v3.13.0.mod) = 4a4dbc85a886af40f549098af07b7c5daa61028496e4bcae44ec3cc64de51913
+SIZE (go/devel_woodpecker-server/woodpecker-server-v3.13.0/v3.13.0.mod) = 10673
+SHA256 (go/devel_woodpecker-server/woodpecker-server-v3.13.0/v3.13.0.zip) = 2fc2f3a3eacbf9f88435b35ad693931cce1f13b6f272aeaf7b67c8d31a430e87
+SIZE (go/devel_woodpecker-server/woodpecker-server-v3.13.0/v3.13.0.zip) = 15823820

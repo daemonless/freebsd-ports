@@ -1,0 +1,53 @@
+#!/bin/sh
+
+# PROVIDE: woodpecker_agent
+# REQUIRE: DAEMON NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="woodpecker_agent"
+rcvar="woodpecker_agent_enable"
+
+load_rc_config $name
+
+: ${woodpecker_agent_enable:="NO"}
+: ${woodpecker_agent_user:="woodpecker"}
+: ${woodpecker_agent_config:="%%ETCDIR%%/agent.conf"}
+: ${woodpecker_agent_log:="/var/log/${name}.log"}
+
+piddir="/var/run/${name}"
+pidfile="${piddir}/${name}.pid"
+procname="%%PREFIX%%/bin/woodpecker-agent"
+command="%%PREFIX%%/bin/woodpecker-agent"
+
+woodpecker_agent_prestart()
+{
+    if [ ! -f "${woodpecker_agent_config}" ]; then
+        err 1 "Configuration file ${woodpecker_agent_config} not found."
+    fi
+
+    mkdir -p "${piddir}"
+    chown -R ${woodpecker_agent_user} "${piddir}"
+
+    if [ ! -f "${woodpecker_agent_log}" ]; then
+        touch "${woodpecker_agent_log}"
+    fi
+    chown ${woodpecker_agent_user} "${woodpecker_agent_log}"
+}
+
+start_precmd="woodpecker_agent_prestart"
+
+woodpecker_agent_start()
+{
+    echo "Starting ${name}."
+    export XDG_DATA_HOME="%%WOODPECKER_WORK_DIR%%"
+    export XDG_CACHE_HOME="%%WOODPECKER_WORK_DIR%%/cache"
+    export XDG_CONFIG_HOME="%%ETCDIR%%"
+    _env_vars=$( ( [ -f "${woodpecker_agent_config}" ] && . "${woodpecker_agent_config}"; set | grep "^WOODPECKER_" | tr "\n" " " ) )
+    /usr/bin/env ${_env_vars} /usr/sbin/daemon -f -p ${pidfile} -u ${woodpecker_agent_user} -o ${woodpecker_agent_log} ${command}
+}
+
+start_cmd="woodpecker_agent_start"
+
+run_rc_command "$1"

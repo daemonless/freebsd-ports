@@ -1,0 +1,5 @@
+TIMESTAMP = 1768767747
+SHA256 (go/devel_woodpecker-plugin-git/woodpecker-plugin-git-2.8.0/v0.0.0-20260110112237-7006f95b27dc.mod) = 5f89dda3fd970710e223fdc5ae8b9dba596a1c4512b0c1531d91bdb5b98e99ed
+SIZE (go/devel_woodpecker-plugin-git/woodpecker-plugin-git-2.8.0/v0.0.0-20260110112237-7006f95b27dc.mod) = 225
+SHA256 (go/devel_woodpecker-plugin-git/woodpecker-plugin-git-2.8.0/v0.0.0-20260110112237-7006f95b27dc.zip) = 8bbaa103b54063e808416d02835b3c6dfeb17a30bdbbdc7c3d0f39f891694b49
+SIZE (go/devel_woodpecker-plugin-git/woodpecker-plugin-git-2.8.0/v0.0.0-20260110112237-7006f95b27dc.zip) = 37408

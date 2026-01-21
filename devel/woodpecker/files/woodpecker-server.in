@@ -1,0 +1,55 @@
+#!/bin/sh
+
+# PROVIDE: woodpecker_server
+# REQUIRE: DAEMON NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="woodpecker_server"
+rcvar="woodpecker_server_enable"
+
+load_rc_config $name
+
+: ${woodpecker_server_enable:="NO"}
+: ${woodpecker_server_user:="woodpecker"}
+: ${woodpecker_server_config:="%%ETCDIR%%/server.conf"}
+: ${woodpecker_server_log:="/var/log/${name}.log"}
+
+piddir="/var/run/${name}"
+pidfile="${piddir}/${name}.pid"
+procname="%%PREFIX%%/bin/woodpecker-server"
+command="%%PREFIX%%/bin/woodpecker-server"
+
+woodpecker_server_prestart()
+{
+    if [ ! -f "${woodpecker_server_config}" ]; then
+        err 1 "Configuration file ${woodpecker_server_config} not found."
+    fi
+
+    if [ ! -d "${piddir}" ]; then
+        mkdir -p "${piddir}"
+    fi
+    chown -R ${woodpecker_server_user} "${piddir}"
+
+    if [ ! -f "${woodpecker_server_log}" ]; then
+        touch "${woodpecker_server_log}"
+    fi
+    chown ${woodpecker_server_user} "${woodpecker_server_log}"
+}
+
+start_precmd="woodpecker_server_prestart"
+
+woodpecker_server_start()
+{
+    echo "Starting ${name}."
+    export XDG_DATA_HOME="%%WOODPECKER_DB_DIR%%"
+    export XDG_CACHE_HOME="%%WOODPECKER_DB_DIR%%/cache"
+    export XDG_CONFIG_HOME="%%ETCDIR%%"
+    _env_vars=$( ( [ -f "${woodpecker_server_config}" ] && . "${woodpecker_server_config}"; set | grep "^WOODPECKER_" | tr "\n" " " ) )
+    /usr/bin/env ${_env_vars} /usr/sbin/daemon -f -p ${pidfile} -u ${woodpecker_server_user} -o ${woodpecker_server_log} ${command}
+}
+
+start_cmd="woodpecker_server_start"
+
+run_rc_command "$1"

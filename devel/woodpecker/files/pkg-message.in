@@ -1,0 +1,22 @@
+[
+{ type: install
+  message: <<EOM
+Woodpecker Agent has been installed.
+
+To use the 'local' backend (running steps directly on the host),
+ensure you have installed the necessary tools (git, etc.) or plugins.
+
+Recommended: Install the native git plugin:
+  pkg install woodpecker-plugin-git
+
+To use it in your pipeline:
+  clone:
+    git:
+      image: local
+      commands:
+        - woodpecker-plugin-git
+
+Note: The 'woodpecker-autoscaler' is not yet included in this port.
+EOM
+}
+]
