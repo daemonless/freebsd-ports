@@ -47,13 +47,18 @@ jobs:
           usesh: true
           copyback: true
           prepare: |
-            pkg install -y bazel5 bash
+            pkg install -y bazel5 bash git
+
+            # Sparse checkout - only Mk/ and sysutils/ocijail
+            git clone --depth 1 --filter=blob:none --sparse \
+              https://git.freebsd.org/ports.git /usr/ports
+            cd /usr/ports
+            git sparse-checkout set Mk Templates Keywords sysutils/ocijail
           run: |
             set -e
 
-            # Setup ports tree for our port
-            mkdir -p /usr/ports/sysutils
-            cp -r sysutils/ocijail /usr/ports/sysutils/
+            # Overlay our patched port
+            cp -r sysutils/ocijail/* /usr/ports/sysutils/ocijail/
 
             # Build package
             cd /usr/ports/sysutils/ocijail
