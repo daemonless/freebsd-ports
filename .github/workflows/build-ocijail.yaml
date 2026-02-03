@@ -68,9 +68,9 @@ jobs:
             cd /usr/ports/sysutils/ocijail
             make package
 
-            # Package goes to /usr/ports/packages/All/ by default
-            ls -la /usr/ports/packages/All/
-            cp /usr/ports/packages/All/ocijail-*.pkg ocijail-0.4.0_2-${{ matrix.arch }}.pkg
+            # Package is created in work/pkg/
+            ls -la work/pkg/
+            cp work/pkg/ocijail-*.pkg ocijail-0.4.0_2-${{ matrix.arch }}.pkg
             ls -la *.pkg
 
       - uses: actions/upload-artifact@v4
