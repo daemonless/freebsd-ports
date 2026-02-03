@@ -66,10 +66,11 @@ jobs:
 
             # Build package
             cd /usr/ports/sysutils/ocijail
-            make package PACKAGES=/tmp/pkg
+            make package
 
-            # Copy out with arch suffix
-            cp /tmp/pkg/All/ocijail-*.pkg ocijail-0.4.0_2-${{ matrix.arch }}.pkg
+            # Package goes to /usr/ports/packages/All/ by default
+            ls -la /usr/ports/packages/All/
+            cp /usr/ports/packages/All/ocijail-*.pkg ocijail-0.4.0_2-${{ matrix.arch }}.pkg
             ls -la *.pkg
 
       - uses: actions/upload-artifact@v4
