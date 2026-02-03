@@ -20,9 +20,7 @@ jobs:
           - arch: aarch64
             vm_arch: "aarch64"
             vm_sync: rsync
-          - arch: riscv64
-            vm_arch: "riscv64"
-            vm_sync: scp
+          # riscv64 excluded - FreeBSD 15 riscv64 has no packages yet
 
     steps:
       - uses: actions/checkout@v4
@@ -68,10 +66,10 @@ jobs:
             cd /usr/ports/sysutils/ocijail
             make package
 
-            # Package is created in work/pkg/
+            # Package is created in work/pkg/ - copy to workspace for artifact upload
             ls -la work/pkg/
-            cp work/pkg/ocijail-*.pkg ocijail-0.4.0_2-${{ matrix.arch }}.pkg
-            ls -la *.pkg
+            cp work/pkg/ocijail-*.pkg $GITHUB_WORKSPACE/ocijail-0.4.0_2-${{ matrix.arch }}.pkg
+            ls -la $GITHUB_WORKSPACE/*.pkg
 
       - uses: actions/upload-artifact@v4
         with:
