@@ -17,12 +17,15 @@ jobs:
           - arch: amd64
             vm_arch: ""
             vm_sync: rsync
+            has_git: true
           - arch: aarch64
             vm_arch: "aarch64"
             vm_sync: rsync
+            has_git: true
           - arch: riscv64
             vm_arch: "riscv64"
             vm_sync: scp
+            has_git: false
 
     steps:
       - uses: actions/checkout@v4
@@ -47,13 +50,31 @@ jobs:
           usesh: true
           copyback: true
           prepare: |
-            pkg install -y bazel5 bash git
+            # Switch to latest packages (quarterly has older pcre2)
+            mkdir -p /usr/local/etc/pkg/repos
+            echo 'FreeBSD: { url: "pkg+http://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            pkg update -f
 
-            # Sparse checkout - only Mk/ and sysutils/ocijail
-            git clone --depth 1 --filter=blob:none --sparse \
-              https://git.freebsd.org/ports.git /usr/ports
-            cd /usr/ports
-            git sparse-checkout set Mk Templates Keywords sysutils/ocijail
+            # riscv64 doesn't have git, use tarball instead
+            if [ "${{ matrix.has_git }}" = "true" ]; then
+              pkg install -y bazel5 bash git
+              # Sparse checkout - only Mk/ and sysutils/ocijail
+              git clone --depth 1 --filter=blob:none --sparse \
+                https://git.freebsd.org/ports.git /usr/ports
+              cd /usr/ports
+              git sparse-checkout set Mk Templates Keywords sysutils/ocijail
+            else
+              pkg install -y bazel5 bash
+              # Fetch ports tarball and extract only what we need
+              fetch -qo /tmp/ports.tar.gz https://github.com/freebsd/freebsd-ports/archive/refs/heads/main.tar.gz
+              mkdir -p /usr/ports
+              tar -xzf /tmp/ports.tar.gz -C /usr/ports --strip-components=1 \
+                'freebsd-ports-main/Mk' \
+                'freebsd-ports-main/Templates' \
+                'freebsd-ports-main/Keywords' \
+                'freebsd-ports-main/sysutils/ocijail'
+              rm /tmp/ports.tar.gz
+            fi
           run: |
             set -e
 
