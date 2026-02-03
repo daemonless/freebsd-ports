@@ -1,0 +1,100 @@
+name: Build ocijail
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sysutils/ocijail/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            vm_arch: ""
+            vm_sync: rsync
+          - arch: aarch64
+            vm_arch: "aarch64"
+            vm_sync: rsync
+          - arch: riscv64
+            vm_arch: "riscv64"
+            vm_sync: scp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Build in FreeBSD VM (${{ matrix.arch }})
+        uses: vmactions/freebsd-vm@v1.3.5
+        with:
+          release: "15.0"
+          arch: ${{ matrix.vm_arch }}
+          sync: ${{ matrix.vm_sync }}
+          usesh: true
+          copyback: true
+          prepare: |
+            pkg install -y bazel5 bash
+          run: |
+            set -e
+
+            # Setup ports tree for our port
+            mkdir -p /usr/ports/sysutils
+            cp -r sysutils/ocijail /usr/ports/sysutils/
+
+            # Build package
+            cd /usr/ports/sysutils/ocijail
+            make package PACKAGES=/tmp/pkg
+
+            # Copy out with arch suffix
+            cp /tmp/pkg/All/ocijail-*.pkg ocijail-0.4.0_2-${{ matrix.arch }}.pkg
+            ls -la *.pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ocijail-${{ matrix.arch }}
+          path: "*.pkg"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: pkgs/
+          merge-multiple: true
+
+      - name: List packages
+        run: ls -la pkgs/
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v0.4.0-patched
+          name: ocijail v0.4.0-patched (mlock support)
+          body: |
+            Patched ocijail with `allow.mlock` annotation support for .NET apps.
+
+            Install:
+            ```sh
+            fetch -qo /tmp/ocijail.pkg https://github.com/daemonless/freebsd-ports/releases/download/v0.4.0-patched/ocijail-0.4.0_2-amd64.pkg
+            pkg install -fy /tmp/ocijail.pkg
+            ```
+          files: pkgs/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
