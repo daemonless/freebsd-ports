@@ -1,0 +1,9 @@
+dbuild is a build tool for daemonless FreeBSD OCI container images.
+It reads a project directory containing Containerfile templates and
+optional configuration, then handles the full image lifecycle: build,
+integration test, SBOM generation, and registry push.
+
+It runs the same way locally and in CI. GitHub Actions and Woodpecker
+call dbuild -- dbuild handles the FreeBSD-specific logic (variant
+detection, architecture mapping, OCI labels, registry auth, skip
+directives, SBOM generation) so CI workflows stay generic.

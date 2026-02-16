@@ -1,0 +1,9 @@
+build:
+  variants:
+    - tag: latest
+      containerfile: Containerfile
+
+cit:
+  mode: health
+  port: 8080
+  health: /

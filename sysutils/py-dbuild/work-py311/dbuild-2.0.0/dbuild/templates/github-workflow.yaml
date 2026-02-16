@@ -1,0 +1,65 @@
+name: Build FreeBSD Container
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['*.md', 'LICENSE', '.gitignore']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DBUILD_REF: v2
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install PyYAML
+      - id: detect
+        run: |
+          curl -sSL "https://github.com/daemonless/dbuild/archive/${{ env.DBUILD_REF }}.tar.gz" | tar xz -C /tmp
+          DBUILD_DIR=$(ls -d /tmp/dbuild-* | head -1)
+          export PYTHONPATH="$DBUILD_DIR"
+          python3 -m dbuild detect --format github
+
+  build:
+    needs: detect
+    if: ${{ needs.detect.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        with:
+          release: "15.0"
+          usesh: true
+          envs: "GITHUB_TOKEN GITHUB_ACTOR"
+          prepare: |
+            set -e
+            mkdir -p /etc/pkg
+            echo 'FreeBSD: { url: "http://pkg.FreeBSD.org/${ABI}/latest" }' > /etc/pkg/FreeBSD.conf
+            pkg update -f
+            pkg install -y podman jq skopeo buildah trivy python3 py311-yaml
+            fetch -qo /tmp/ocijail.pkg "https://github.com/daemonless/freebsd-ports/releases/download/v0.4.0-patched/ocijail-0.4.0_2-amd64.pkg"
+            pkg install -fy /tmp/ocijail.pkg
+            rm -rf /var/db/containers /var/lib/containers 2>/dev/null || true
+            kldload pf
+            sysctl net.inet.ip.forwarding=1
+          run: |
+            set -e
+            fetch -qo dbuild-ci.sh \
+              "https://raw.githubusercontent.com/daemonless/dbuild/${{ env.DBUILD_REF }}/dbuild-ci.sh"
+            sh dbuild-ci.sh ${{ matrix.tag }}
