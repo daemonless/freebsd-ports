@@ -68,7 +68,7 @@ jobs:
 
             # Package is created in work/pkg/ - copy to workspace for artifact upload
             ls -la work/pkg/
-            cp work/pkg/ocijail-*.pkg $GITHUB_WORKSPACE/ocijail-0.4.0_2-${{ matrix.arch }}.pkg
+            cp work/pkg/ocijail-*.pkg $GITHUB_WORKSPACE/ocijail-${{ matrix.arch }}.pkg
             ls -la $GITHUB_WORKSPACE/*.pkg
 
       - uses: actions/upload-artifact@v4
@@ -92,15 +92,18 @@ jobs:
 
       - uses: softprops/action-gh-release@v1
         with:
-          tag_name: v0.4.0-patched
-          name: ocijail v0.4.0-patched (mlock support)
+          tag_name: latest
+          name: ocijail (patched)
           body: |
-            Patched ocijail with `allow.mlock` annotation support for .NET apps.
+            Patched ocijail with `allow.*` annotation support for FreeBSD jail parameters.
 
             Install:
             ```sh
-            fetch -qo /tmp/ocijail.pkg https://github.com/daemonless/freebsd-ports/releases/download/v0.4.0-patched/ocijail-0.4.0_2-amd64.pkg
-            pkg install -fy /tmp/ocijail.pkg
+            # amd64
+            doas pkg add https://github.com/daemonless/freebsd-ports/releases/latest/download/ocijail-amd64.pkg
+
+            # aarch64
+            doas pkg add https://github.com/daemonless/freebsd-ports/releases/latest/download/ocijail-aarch64.pkg
             ```
           files: pkgs/*
           fail_on_unmatched_files: true
