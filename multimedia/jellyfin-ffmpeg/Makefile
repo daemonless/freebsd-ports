@@ -16,8 +16,7 @@ LICENSE_PERMS_FRAUNHOFER_FDK_AAC=	auto-accept
 LICENSE_PERMS_NONFREE=	auto-accept
 
 BUILD_DEPENDS=	nasm:devel/nasm \
-		${LOCALBASE}/include/vulkan/vulkan.h:graphics/vulkan-headers \
-		${LOCALBASE}/include/ffnvcodec/nvEncodeAPI.h:multimedia/ffnvcodec-headers
+		${LOCALBASE}/include/vulkan/vulkan.h:graphics/vulkan-headers
 PATCH_DEPENDS=	quilt:devel/quilt
 LIB_DEPENDS=	libass.so:multimedia/libass \
 		libbluray.so:multimedia/libbluray \
@@ -124,12 +123,7 @@ CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 		--enable-vulkan \
 		--enable-vaapi \
 		--enable-vdpau \
-		--enable-ffnvcodec \
-		--enable-cuda \
-		--enable-cuda-llvm \
-		--enable-cuvid \
-		--enable-nvdec \
-		--enable-nvenc
+		--disable-ffnvcodec
 
 INSTALL_TARGET=	install-progs install-data install-libs install-headers
 
