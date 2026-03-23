@@ -55,8 +55,7 @@ LIB_DEPENDS=	libass.so:multimedia/libass \
 		libasound.so:audio/alsa-lib \
 		libsndio.so:audio/sndio
 
-USES=		compiler:c17 gmake localbase:ldflags perl5 pkgconfig tar:xz
-USE_PERL5=	build
+USES=		compiler:c17 gmake localbase:ldflags pkgconfig tar:xz
 USE_GITHUB=	yes
 GH_ACCOUNT=	jellyfin
 GH_PROJECT=	jellyfin-ffmpeg
