@@ -40,6 +40,7 @@ jobs:
         uses: vmactions/freebsd-vm@v1.3.5
         with:
           release: "15.0"
+          vnc_password: ${{ secrets.VNC_PASSWORD }}
           arch: ${{ matrix.vm_arch }}
           sync: ${{ matrix.vm_sync }}
           usesh: true
