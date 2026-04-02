@@ -1,5 +1,5 @@
 PORTNAME=	jellyfin-ffmpeg
-PORTVERSION=	7.1.3.3
+PORTVERSION=	7.1.3.4
 CATEGORIES=	multimedia
 
 MAINTAINER=	ahze@FreeBSD.org
@@ -58,7 +58,7 @@ USES=		compiler:c17 gmake localbase:ldflags pkgconfig tar:xz
 USE_GITHUB=	yes
 GH_ACCOUNT=	jellyfin
 GH_PROJECT=	jellyfin-ffmpeg
-GH_TAGNAME=	v7.1.3-3
+GH_TAGNAME=	v7.1.3-4
 
 # Bundle av* libs alongside the binary, mirroring the jellyfin-ffmpeg layout:
 #   /usr/local/lib/jellyfin-ffmpeg/bin/ffmpeg
