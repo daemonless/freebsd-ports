@@ -7,11 +7,8 @@ MAINTAINER=	ahze@FreeBSD.org
 COMMENT=	FFmpeg with patches for HDR tone mapping (tonemapx/libplacebo)
 WWW=		https://github.com/jellyfin/jellyfin-ffmpeg
 
-LICENSE=	GPLv2+ LGPL21+ FRAUNHOFER_FDK_AAC
+LICENSE=	GPLv2+ LGPL21+
 LICENSE_COMB=	multi
-LICENSE_NAME_FRAUNHOFER_FDK_AAC=	Software License for The Fraunhofer FDK AAC Codec Library for Android
-LICENSE_TEXT_FRAUNHOFER_FDK_AAC=	See audio/fdk-aac for full license text
-LICENSE_PERMS_FRAUNHOFER_FDK_AAC=	auto-accept
 
 BUILD_DEPENDS=	nasm:devel/nasm \
 		${LOCALBASE}/include/vulkan/vulkan.h:graphics/vulkan-headers
