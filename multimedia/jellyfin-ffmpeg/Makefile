@@ -1,19 +1,17 @@
 PORTNAME=	jellyfin-ffmpeg
 PORTVERSION=	7.1.3.4
+PORTREVISION=	1
 CATEGORIES=	multimedia
 
 MAINTAINER=	ahze@FreeBSD.org
 COMMENT=	FFmpeg with patches for HDR tone mapping (tonemapx/libplacebo)
 WWW=		https://github.com/jellyfin/jellyfin-ffmpeg
 
-LICENSE=	GPLv2+ LGPL21+ FRAUNHOFER_FDK_AAC NONFREE
+LICENSE=	GPLv2+ LGPL21+ FRAUNHOFER_FDK_AAC
 LICENSE_COMB=	multi
 LICENSE_NAME_FRAUNHOFER_FDK_AAC=	Software License for The Fraunhofer FDK AAC Codec Library for Android
-LICENSE_NAME_NONFREE=	Non free code
-LICENSE_TEXT_NONFREE=	Enabling fdk-aac restricts redistribution
 LICENSE_TEXT_FRAUNHOFER_FDK_AAC=	See audio/fdk-aac for full license text
 LICENSE_PERMS_FRAUNHOFER_FDK_AAC=	auto-accept
-LICENSE_PERMS_NONFREE=	auto-accept
 
 BUILD_DEPENDS=	nasm:devel/nasm \
 		${LOCALBASE}/include/vulkan/vulkan.h:graphics/vulkan-headers
@@ -91,7 +89,6 @@ CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 		--enable-lto=auto \
 		--enable-gpl \
 		--enable-version3 \
-		--enable-nonfree \
 		--enable-shared \
 		--enable-gmp \
 		--enable-gnutls \
