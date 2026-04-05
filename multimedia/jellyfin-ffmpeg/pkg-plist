@@ -182,4 +182,3 @@ lib/jellyfin-ffmpeg/share/ffmpeg/libvpx-1080p50_60.ffpreset
 lib/jellyfin-ffmpeg/share/ffmpeg/libvpx-360p.ffpreset
 lib/jellyfin-ffmpeg/share/ffmpeg/libvpx-720p.ffpreset
 lib/jellyfin-ffmpeg/share/ffmpeg/libvpx-720p50_60.ffpreset
-libdata/ldconfig/jellyfin-ffmpeg

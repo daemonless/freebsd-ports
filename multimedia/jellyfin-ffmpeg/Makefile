@@ -1,6 +1,5 @@
 PORTNAME=	jellyfin-ffmpeg
-PORTVERSION=	7.1.3.4
-PORTREVISION=	1
+PORTVERSION=	7.1.3.5
 CATEGORIES=	multimedia
 
 MAINTAINER=	ahze@FreeBSD.org
@@ -36,7 +35,7 @@ LIB_DEPENDS=	libass.so:multimedia/libass \
 		libwebp.so:graphics/webp \
 		libx264.so:multimedia/libx264 \
 		libx265.so:multimedia/x265 \
-		libzimg.so:graphics/zimg \
+		libzimg.so:graphics/sekrit-twc-zimg \
 		libzvbi.so:devel/libzvbi \
 		libgnutls.so:security/gnutls \
 		libxml2.so:textproc/libxml2 \
@@ -53,7 +52,7 @@ USES=		compiler:c17 gmake localbase:ldflags pkgconfig tar:xz
 USE_GITHUB=	yes
 GH_ACCOUNT=	jellyfin
 GH_PROJECT=	jellyfin-ffmpeg
-GH_TAGNAME=	v7.1.3-4
+GH_TAGNAME=	v${PORTVERSION:C/\.([0-9]+)$/-\1/}
 
 # Bundle av* libs alongside the binary, mirroring the jellyfin-ffmpeg layout:
 #   /usr/local/lib/jellyfin-ffmpeg/bin/ffmpeg
@@ -123,7 +122,7 @@ INSTALL_TARGET=	install-progs install-data install-libs install-headers
 
 post-install:
 	# Symlinks in /usr/local/bin for PATH access
-	${LN} -sf ${JFFMPEG_DIR}/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg
-	${LN} -sf ${JFFMPEG_DIR}/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe
+	${LN} -sf ../lib/jellyfin-ffmpeg/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg
+	${LN} -sf ../lib/jellyfin-ffmpeg/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe
 
 .include <bsd.port.mk>
