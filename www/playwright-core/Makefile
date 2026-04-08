@@ -1,5 +1,6 @@
 PORTNAME=	playwright-core
 DISTVERSION=	1.59.1
+PORTREVISION=	1
 CATEGORIES=	www
 
 MAINTAINER=	ahze@FreeBSD.org
