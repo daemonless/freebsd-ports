@@ -1,0 +1,5 @@
+#!/bin/sh
+export PLAYWRIGHT_BROWSERS_PATH=%%PREFIX%%/libexec/ms-playwright
+export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=%%PLATFORM%%
+exec %%NODE%% %%PREFIX%%/lib/node_modules/playwright-core/cli.js "$@"
