@@ -152,10 +152,10 @@ lib/jellyfin-ffmpeg/lib/libavdevice.so.61
 lib/jellyfin-ffmpeg/lib/libavdevice.so.61.3.100
 lib/jellyfin-ffmpeg/lib/libavfilter.so
 lib/jellyfin-ffmpeg/lib/libavfilter.so.10
-lib/jellyfin-ffmpeg/lib/libavfilter.so.10.4.100
+lib/jellyfin-ffmpeg/lib/libavfilter.so.10.5.100
 lib/jellyfin-ffmpeg/lib/libavformat.so
 lib/jellyfin-ffmpeg/lib/libavformat.so.61
-lib/jellyfin-ffmpeg/lib/libavformat.so.61.7.100
+lib/jellyfin-ffmpeg/lib/libavformat.so.61.7.103
 lib/jellyfin-ffmpeg/lib/libavutil.so
 lib/jellyfin-ffmpeg/lib/libavutil.so.59
 lib/jellyfin-ffmpeg/lib/libavutil.so.59.39.100

@@ -1,5 +1,5 @@
 PORTNAME=	jellyfin-ffmpeg
-PORTVERSION=	7.1.3.6
+PORTVERSION=	7.1.4.1
 CATEGORIES=	multimedia
 
 MAINTAINER=	ahze@FreeBSD.org
