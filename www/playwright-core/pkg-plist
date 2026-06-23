@@ -89,7 +89,7 @@ lib/node_modules/playwright-core/lib/vite/traceViewer/codeMirrorModule.DYBRYzYX.
 lib/node_modules/playwright-core/lib/vite/traceViewer/codicon.DCmgc-ay.ttf
 lib/node_modules/playwright-core/lib/vite/traceViewer/defaultSettingsView.CjdS-WJx.css
 lib/node_modules/playwright-core/lib/vite/traceViewer/index.CzXZzn5A.css
-lib/node_modules/playwright-core/lib/vite/traceViewer/index.DEBl1tfz.js
+lib/node_modules/playwright-core/lib/vite/traceViewer/index.DMMX1gXU.js
 lib/node_modules/playwright-core/lib/vite/traceViewer/index.html
 lib/node_modules/playwright-core/lib/vite/traceViewer/manifest.webmanifest
 lib/node_modules/playwright-core/lib/vite/traceViewer/playwright-logo.svg
@@ -105,3 +105,6 @@ lib/node_modules/playwright-core/package.json
 lib/node_modules/playwright-core/types/protocol.d.ts
 lib/node_modules/playwright-core/types/structs.d.ts
 lib/node_modules/playwright-core/types/types.d.ts
+libexec/ms-playwright/chromium-1228/chrome-freebsdamd64/chrome
+libexec/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-freebsdamd64/chrome-headless-shell
+libexec/ms-playwright/ffmpeg-1011/ffmpeg-freebsd
