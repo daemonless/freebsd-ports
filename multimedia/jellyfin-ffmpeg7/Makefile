@@ -1,5 +1,5 @@
-PORTNAME=	jellyfin-ffmpeg
-PORTVERSION=	7.1.4.2
+PORTNAME=	jellyfin-ffmpeg7
+PORTVERSION=	7.1.4.3
 CATEGORIES=	multimedia
 
 MAINTAINER=	ahze@FreeBSD.org
@@ -54,11 +54,15 @@ GH_ACCOUNT=	jellyfin
 GH_PROJECT=	jellyfin-ffmpeg
 GH_TAGNAME=	v${PORTVERSION:C/\.([0-9]+)$/-\1/}
 
-# Bundle av* libs alongside the binary, mirroring the jellyfin-ffmpeg layout:
-#   /usr/local/lib/jellyfin-ffmpeg/bin/ffmpeg
-#   /usr/local/lib/jellyfin-ffmpeg/bin/ffprobe
-#   /usr/local/lib/jellyfin-ffmpeg/lib/libav*.so*  <- registered via ldconfig
-JFFMPEG_DIR=	${PREFIX}/lib/jellyfin-ffmpeg
+# Everything installs into a private subdir so nothing collides with
+# multimedia/ffmpeg or with jellyfin-ffmpeg8. Standard PREFIX is untouched:
+#   ${PREFIX}/lib/jellyfin-ffmpeg7/bin/ffmpeg   <- real binary
+#   ${PREFIX}/lib/jellyfin-ffmpeg7/lib/libav*   <- bundled libs (ldconfig)
+#   ${PREFIX}/bin/jellyfin-ffmpeg7              <- version-suffixed symlink
+# The only files outside the private dir are the suffixed bin/ symlinks.
+# --enable-rpath (below) makes the binary load these bundled libs even when
+# base multimedia/ffmpeg is installed with the same soname.
+JFFMPEG_DIR=	${PREFIX}/lib/jellyfin-ffmpeg7
 USE_LDCONFIG=	${JFFMPEG_DIR}/lib
 
 post-patch:
@@ -73,6 +77,7 @@ MAKE_ENV+=	V=1
 
 CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 		--libdir="${JFFMPEG_DIR}/lib" \
+		--enable-rpath \
 		--target-os=freebsd \
 		--cc="${CC}" --cxx="${CXX}" \
 		--extra-version=Jellyfin \
@@ -121,8 +126,12 @@ CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 INSTALL_TARGET=	install-progs install-data install-libs install-headers
 
 post-install:
-	# Symlinks in /usr/local/bin for PATH access
-	${LN} -sf ../lib/jellyfin-ffmpeg/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg
-	${LN} -sf ../lib/jellyfin-ffmpeg/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe
+	# Version-suffixed symlinks in /usr/local/bin for PATH access
+	${LN} -sf ../lib/jellyfin-ffmpeg7/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg7
+	${LN} -sf ../lib/jellyfin-ffmpeg7/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe7
+	# Unversioned alias: this port is the current jellyfin-ffmpeg. Consumers
+	# (jellyfin, immich) reference the stable /usr/local/bin/jellyfin-ffmpeg.
+	${LN} -sf ../lib/jellyfin-ffmpeg7/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg
+	${LN} -sf ../lib/jellyfin-ffmpeg7/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe
 
 .include <bsd.port.mk>
