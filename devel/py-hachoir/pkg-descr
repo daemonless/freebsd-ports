@@ -1,0 +1,13 @@
+Hachoir is a Python library to view and edit a binary stream field by field.
+In other words, Hachoir allows you to "browse" any binary stream just like you
+browse directories and files.
+
+A file is split in a tree of fields, where the smallest field is just one
+bit. Examples of field types: integers, strings, bits, padding types, floats,
+etc.
+
+Command line tools included with Hachoir:
+* hachoir-grep: find a text pattern in a binary file
+* hachoir-metadata: get metadata from binary files
+* hachoir-strip: modify a file to remove metadata
+* hachoir-urwid: display the content of a binary file in text mode
