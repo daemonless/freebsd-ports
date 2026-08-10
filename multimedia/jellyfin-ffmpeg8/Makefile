@@ -1,5 +1,6 @@
 PORTNAME=	jellyfin-ffmpeg8
 PORTVERSION=	8.1.2.2
+PORTREVISION=	1
 CATEGORIES=	multimedia
 
 MAINTAINER=	ahze@FreeBSD.org
@@ -81,10 +82,14 @@ CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 		--target-os=freebsd \
 		--cc="${CC}" --cxx="${CXX}" \
 		--extra-version=Jellyfin \
+		--disable-unstable \
 		--disable-doc \
 		--disable-ffplay \
 		--disable-static \
 		--disable-libxcb \
+		--disable-libxcb-shm \
+		--disable-libxcb-xfixes \
+		--disable-libxcb-shape \
 		--disable-sdl2 \
 		--disable-xlib \
 		--enable-lto=auto \
