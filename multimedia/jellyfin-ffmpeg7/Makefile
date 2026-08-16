@@ -2,7 +2,7 @@ PORTNAME=	jellyfin-ffmpeg7
 PORTVERSION=	7.1.4.3
 CATEGORIES=	multimedia
 
-MAINTAINER=	ahze@FreeBSD.org
+MAINTAINER=	michaeljohnson@ahze.net
 COMMENT=	FFmpeg with patches for HDR tone mapping (tonemapx/libplacebo)
 WWW=		https://github.com/jellyfin/jellyfin-ffmpeg
 
@@ -62,6 +62,11 @@ GH_TAGNAME=	v${PORTVERSION:C/\.([0-9]+)$/-\1/}
 # The only files outside the private dir are the suffixed bin/ symlinks.
 # --enable-rpath (below) makes the binary load these bundled libs even when
 # base multimedia/ffmpeg is installed with the same soname.
+# The bundled headers stay under the private prefix so they do not collide
+# with multimedia/ffmpeg's include/libav*. The pkg-config files are relocated
+# in post-install to libdata/pkgconfig with a jellyfin-ffmpeg7- filename prefix
+# (Requires tokens rewritten to match) so they are discoverable system-wide
+# without colliding with multimedia/ffmpeg's libav*.pc.
 JFFMPEG_DIR=	${PREFIX}/lib/jellyfin-ffmpeg7
 USE_LDCONFIG=	${JFFMPEG_DIR}/lib
 
@@ -133,5 +138,16 @@ post-install:
 	# (jellyfin, immich) reference the stable /usr/local/bin/jellyfin-ffmpeg.
 	${LN} -sf ../lib/jellyfin-ffmpeg7/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg
 	${LN} -sf ../lib/jellyfin-ffmpeg7/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe
+	# Relocate the private pkg-config files to libdata/pkgconfig under a
+	# jellyfin-ffmpeg7- prefix. Rewrite Name and the Requires cross-refs so
+	# pkg-config resolves them to each other, not to multimedia/ffmpeg.
+	@${MKDIR} ${STAGEDIR}${PREFIX}/libdata/pkgconfig
+	@cd ${STAGEDIR}${JFFMPEG_DIR}/lib/pkgconfig && for pc in *.pc; do \
+		${SED} -E \
+			-e 's/^(Name: )/\1jellyfin-ffmpeg7-/' \
+			-e '/^Requires/ s/lib(avcodec|avdevice|avfilter|avformat|avutil|postproc|swresample|swscale)/jellyfin-ffmpeg7-lib\1/g' \
+			$${pc} > ${STAGEDIR}${PREFIX}/libdata/pkgconfig/jellyfin-ffmpeg7-$${pc}; \
+	done
+	${RM} -r ${STAGEDIR}${JFFMPEG_DIR}/lib/pkgconfig
 
 .include <bsd.port.mk>
