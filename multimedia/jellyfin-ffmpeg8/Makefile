@@ -1,14 +1,16 @@
 PORTNAME=	jellyfin-ffmpeg8
-PORTVERSION=	8.1.2.2
-PORTREVISION=	1
+PORTVERSION=	8.1.2.3
 CATEGORIES=	multimedia
 
-MAINTAINER=	ahze@FreeBSD.org
+MAINTAINER=	michaeljohnson@ahze.net
 COMMENT=	FFmpeg with patches for HDR tone mapping (tonemapx/libplacebo)
 WWW=		https://github.com/jellyfin/jellyfin-ffmpeg
 
 LICENSE=	GPLv2+ LGPL21+
 LICENSE_COMB=	multi
+
+ONLY_FOR_ARCHS=	aarch64 amd64
+ONLY_FOR_ARCHS_REASON=	upstream jellyfin-ffmpeg targets 64-bit; 32-bit builds non-PIC asm that lld rejects
 
 BUILD_DEPENDS=	nasm:devel/nasm \
 		${LOCALBASE}/include/vulkan/vulkan.h:graphics/vulkan-headers
@@ -56,19 +58,14 @@ GH_PROJECT=	jellyfin-ffmpeg
 GH_TAGNAME=	v${PORTVERSION:C/\.([0-9]+)$/-\1/}
 
 # Everything installs into a private subdir so nothing collides with
-# multimedia/ffmpeg or with jellyfin-ffmpeg7. Standard PREFIX is untouched:
-#   ${PREFIX}/lib/jellyfin-ffmpeg8/bin/ffmpeg   <- real binary
-#   ${PREFIX}/lib/jellyfin-ffmpeg8/lib/libav*   <- bundled libs (ldconfig)
-#   ${PREFIX}/bin/jellyfin-ffmpeg8              <- version-suffixed symlink
-# The only files outside the private dir are the suffixed bin/ symlinks.
-# --enable-rpath (below) makes the binary load these bundled libs even when
-# base multimedia/ffmpeg is installed with the same soname.
+# multimedia/ffmpeg or jellyfin-ffmpeg7; only the suffixed bin/ symlinks land
+# in PREFIX. --enable-rpath lets the binary load the bundled libs without
+# ldconfig even when base ffmpeg shares the same soname.
 JFFMPEG_DIR=	${PREFIX}/lib/jellyfin-ffmpeg8
-USE_LDCONFIG=	${JFFMPEG_DIR}/lib
 
 post-patch:
 	cd ${WRKSRC} && QUILT_PATCHES=debian/patches quilt push -a || \
-	    QUILT_PATCHES=debian/patches quilt applied | ${GREP} -q 0094
+	    QUILT_PATCHES=debian/patches quilt applied | ${GREP} -q 0098
 
 HAS_CONFIGURE=	yes
 CONFIGURE_LOG=	ffbuild/config.log
@@ -87,9 +84,6 @@ CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 		--disable-ffplay \
 		--disable-static \
 		--disable-libxcb \
-		--disable-libxcb-shm \
-		--disable-libxcb-xfixes \
-		--disable-libxcb-shape \
 		--disable-sdl2 \
 		--disable-xlib \
 		--enable-lto=auto \
@@ -128,10 +122,10 @@ CONFIGURE_ARGS=	--prefix="${JFFMPEG_DIR}" \
 		--enable-vdpau \
 		--disable-ffnvcodec
 
-INSTALL_TARGET=	install-progs install-data install-libs install-headers
+INSTALL_TARGET=	install-progs install-data install-libs
 
 post-install:
-	# Symlinks in /usr/local/bin for PATH access
+	# Version-suffixed symlinks in /usr/local/bin for PATH access
 	${LN} -sf ../lib/jellyfin-ffmpeg8/bin/ffmpeg ${STAGEDIR}${PREFIX}/bin/jellyfin-ffmpeg8
 	${LN} -sf ../lib/jellyfin-ffmpeg8/bin/ffprobe ${STAGEDIR}${PREFIX}/bin/jellyfin-ffprobe8
 
