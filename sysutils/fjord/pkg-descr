@@ -1,0 +1,8 @@
+fjord is a web UI for managing container "compose" stacks on FreeBSD. It reads
+compose files directly from the filesystem (no vendor lock-in), drives podman
+(or appjail) to run them, and includes a daemonless app store for one-click
+installs.
+
+The daemon (fjordd) serves the UI and talks to the container engine. A System
+page runs host-readiness checks (missing tools, dead podman socket, pf rules)
+with copyable fixes.
