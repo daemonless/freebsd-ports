@@ -30,6 +30,8 @@ PODMAN_RUN_DEPENDS=	podman:sysutils/podman \
 PLIST_FILES=	sbin/fjordd \
 		etc/rc.d/fjordd
 
+SUB_FILES=	pkg-message
+
 post-patch:
 	@${REINPLACE_CMD} 's|/usr/local|${PREFIX}|g' ${WRKSRC}/packaging/fjordd.rc
 
