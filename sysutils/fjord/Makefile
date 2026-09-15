@@ -1,5 +1,6 @@
 PORTNAME=	fjord
 DISTVERSION=	0.2.2
+PORTREVISION=	1
 CATEGORIES=	sysutils
 MASTER_SITES=	https://github.com/daemonless/${PORTNAME}/releases/download/v${DISTVERSION}/
 
@@ -25,7 +26,8 @@ PODMAN_DESC=	Podman engine (podman, podman-compose)
 APPJAIL_RUN_DEPENDS=	appjail:sysutils/appjail \
 		appjail-director:sysutils/py-director
 PODMAN_RUN_DEPENDS=	podman:sysutils/podman \
-		podman-compose:sysutils/podman-compose
+		podman-compose:sysutils/podman-compose \
+		${LOCALBASE}/libexec/cni/dnsname:sysutils/cni-dnsname
 
 PLIST_FILES=	sbin/fjordd \
 		etc/rc.d/fjordd
