@@ -1,6 +1,6 @@
 PORTNAME=	cni-epair
 DISTVERSIONPREFIX=	v
-DISTVERSION=	1.0.0
+DISTVERSION=	1.0.1
 CATEGORIES=	sysutils
 
 MAINTAINER=	michaeljohnson@ahze.net
@@ -19,10 +19,23 @@ GH_ACCOUNT=	daemonless
 NO_ARCH=	yes
 NO_BUILD=	yes
 
+OPTIONS_DEFINE=	DOCS EXAMPLES
+OPTIONS_DEFAULT=	DOCS EXAMPLES
+
 PLIST_FILES=	libexec/cni/epair
+PORTDOCS=	README.md
+PORTEXAMPLES=	*
 
 do-install:
 	${MKDIR} ${STAGEDIR}${PREFIX}/libexec/cni
 	${INSTALL_SCRIPT} ${WRKSRC}/epair ${STAGEDIR}${PREFIX}/libexec/cni
+
+do-install-DOCS-on:
+	${MKDIR} ${STAGEDIR}${DOCSDIR}
+	${INSTALL_DATA} ${WRKSRC}/README.md ${STAGEDIR}${DOCSDIR}
+
+do-install-EXAMPLES-on:
+	${MKDIR} ${STAGEDIR}${EXAMPLESDIR}
+	${INSTALL_DATA} ${WRKSRC}/examples/* ${STAGEDIR}${EXAMPLESDIR}
 
 .include <bsd.port.mk>
