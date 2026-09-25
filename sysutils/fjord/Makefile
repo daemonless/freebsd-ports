@@ -1,6 +1,5 @@
 PORTNAME=	fjord
-DISTVERSION=	0.2.2
-PORTREVISION=	1
+DISTVERSION=	0.3.0-rc1
 CATEGORIES=	sysutils
 MASTER_SITES=	https://github.com/daemonless/${PORTNAME}/releases/download/v${DISTVERSION}/
 
@@ -16,6 +15,8 @@ USES=		go:modules
 GO_TARGET=	./cmd/fjordd:${PREFIX}/sbin/fjordd
 GO_LDFLAGS=	-X main.version=${DISTVERSION}
 
+USE_RC_SUBR=	fjordd
+
 OPTIONS_MULTI=	ENGINE
 OPTIONS_MULTI_ENGINE=	APPJAIL PODMAN
 OPTIONS_DEFAULT=	APPJAIL PODMAN
@@ -29,17 +30,8 @@ PODMAN_RUN_DEPENDS=	podman:sysutils/podman \
 		podman-compose:sysutils/podman-compose \
 		${LOCALBASE}/libexec/cni/dnsname:sysutils/cni-dnsname
 
-PLIST_FILES=	sbin/fjordd \
-		etc/rc.d/fjordd
+PLIST_FILES=	sbin/fjordd
 
 SUB_FILES=	pkg-message
-
-post-patch:
-	@${REINPLACE_CMD} 's|/usr/local|${PREFIX}|g' ${WRKSRC}/packaging/fjordd.rc
-
-post-install:
-	@${MKDIR} ${STAGEDIR}${PREFIX}/etc/rc.d
-	${INSTALL_SCRIPT} ${WRKSRC}/packaging/fjordd.rc \
-		${STAGEDIR}${PREFIX}/etc/rc.d/fjordd
 
 .include <bsd.port.mk>
