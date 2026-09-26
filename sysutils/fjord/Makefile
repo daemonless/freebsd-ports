@@ -1,5 +1,6 @@
 PORTNAME=	fjord
 DISTVERSION=	0.3.0-rc2
+PORTREVISION=	1
 CATEGORIES=	sysutils
 MASTER_SITES=	https://github.com/daemonless/${PORTNAME}/releases/download/v${DISTVERSION}/
 
@@ -10,7 +11,7 @@ WWW=		https://fjord.daemonless.io
 LICENSE=	BSD2CLAUSE
 LICENSE_FILE=	${WRKSRC}/LICENSE
 
-USES=		go:modules
+USES=		go:modules python:env
 
 GO_TARGET=	./cmd/fjordd:${PREFIX}/sbin/fjordd
 GO_LDFLAGS=	-X main.version=${DISTVERSION}
@@ -24,10 +25,11 @@ ENGINE_DESC=	Container engines (at least one)
 APPJAIL_DESC=	AppJail engine (appjail, appjail-director)
 PODMAN_DESC=	Podman engine (podman, podman-compose)
 
-APPJAIL_RUN_DEPENDS=	appjail:sysutils/appjail \
-		appjail-director:sysutils/py-director
+APPJAIL_RUN_DEPENDS=	appjail>=5.5.0:sysutils/appjail \
+		${PYTHON_PKGNAMEPREFIX}director>=0.18.0:sysutils/py-director@${PY_FLAVOR}
 PODMAN_RUN_DEPENDS=	podman:sysutils/podman \
-		podman-compose:sysutils/podman-compose \
+		${PYTHON_PKGNAMEPREFIX}podman-compose>=1.2.0:sysutils/podman-compose@${PY_FLAVOR} \
+		ocijail>=0.6.1:sysutils/ocijail \
 		${LOCALBASE}/libexec/cni/dnsname:sysutils/cni-dnsname
 
 PLIST_FILES=	sbin/fjordd
