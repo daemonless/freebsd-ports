@@ -29,7 +29,8 @@ APPJAIL_RUN_DEPENDS=	appjail>=5.5.0:sysutils/appjail \
 PODMAN_RUN_DEPENDS=	podman:sysutils/podman \
 		${PYTHON_PKGNAMEPREFIX}podman-compose>=1.2.0:sysutils/podman-compose@${PY_FLAVOR} \
 		ocijail>=0.6.0:sysutils/ocijail \
-		${LOCALBASE}/libexec/cni/dnsname:sysutils/cni-dnsname
+		${LOCALBASE}/libexec/cni/dnsname:sysutils/cni-dnsname \
+		${LOCALBASE}/libexec/cni/epair:sysutils/cni-epair
 
 PLIST_FILES=	sbin/fjordd
 
