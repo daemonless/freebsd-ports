@@ -1,3 +1,0 @@
-Playwright is a browser automation library supporting Chromium, Firefox,
-and WebKit. This port installs playwright-core with FreeBSD-native patches
-so Chromium runs without Linux emulation or platform masquerade.
