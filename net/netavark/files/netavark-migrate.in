@@ -19,6 +19,7 @@ EPAIR_NV_BIN="${PREFIX}/libexec/netavark/epair"
 FLUA_BIN="/usr/libexec/flua"
 DEFAULT_DNS_BIND_PORT="5300"
 PODMAN_CONF_OVERRIDE=""
+PODMAN_SOCK="${NETAVARK_MIGRATE_SOCK:-}"
 
 usage() {
 	cat <<'EOF'
@@ -65,6 +66,27 @@ podman_major() {
 
 backend_of() {
 	pman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || printf 'unknown'
+}
+
+podman_service_socket() {
+	if [ -n "$PODMAN_SOCK" ]; then
+		printf '%s\n' "$PODMAN_SOCK"
+		return
+	fi
+	_sock=$(sysrc -qn podman_service_api_socket 2>/dev/null || true)
+	if [ -n "$_sock" ]; then
+		printf '%s\n' "$_sock"
+		return
+	fi
+	_rundir=$(sysrc -qn podman_service_api_rundir 2>/dev/null || true)
+	[ -n "$_rundir" ] || _rundir="/var/run/podman"
+	printf '%s/podman.sock\n' "$_rundir"
+}
+
+service_backend_of() {
+	_sock=$(podman_service_socket)
+	[ -S "$_sock" ] || return 0
+	pman --url "unix://$_sock" info --format '{{.Host.NetworkBackend}}' 2>/dev/null || true
 }
 
 stale_cni_conf_files() {
@@ -863,15 +885,29 @@ EOF
 		BACKEND=$(backend_of)
 	fi
 	say "  backend: $BACKEND"
+	SVC_MISMATCH=0
+	DNS_NEEDS_CFG=0
+	SVC_SOCK=$(podman_service_socket)
+	SVC_BACKEND=$(service_backend_of)
+	if [ -n "$SVC_BACKEND" ]; then
+		if [ "$SVC_BACKEND" = "$BACKEND" ]; then
+			say "  podman_service: $SVC_BACKEND ($SVC_SOCK, matches config)"
+		else
+			say "  podman_service: $SVC_BACKEND ($SVC_SOCK) != configured '$BACKEND'"
+			warn "running podman_service uses '$SVC_BACKEND' while configuration selects '$BACKEND'; fix: service podman_service restart"
+			WARNINGS=$((WARNINGS + 1))
+			SVC_MISMATCH=1
+		fi
+	fi
 	if [ "$PMAJOR" -lt 6 ]; then
-		if [ "$BACKEND" = "netavark" ]; then
+		if [ "$BACKEND" = "netavark" ] && [ "$SVC_MISMATCH" -eq 0 ]; then
 			say "  already running on netavark"
 			if [ -d "$STATE_DIR" ]; then
 				say "  rollback state present in $STATE_DIR (run 'netavark-migrate back' to return to CNI)"
 			fi
 			return 2
 		fi
-		if [ "$BACKEND" != "cni" ]; then
+		if [ "$BACKEND" != "cni" ] && [ "$BACKEND" != "netavark" ]; then
 			err "unexpected Podman network backend '$BACKEND'"
 			BLOCKERS=$((BLOCKERS + 1))
 		fi
@@ -1025,6 +1061,7 @@ EOF
 	[ "$FILTER_LOCAL" != "1" ] && HOST_NET_WORK=1
 	[ "$IP_FWD" != "1" ] && HOST_NET_WORK=1
 	[ "$DNS_NEEDS_CFG" -eq 1 ] && HOST_NET_WORK=1
+	[ "$SVC_MISMATCH" -eq 1 ] && HOST_NET_WORK=1
 
 	say ""
 	say "== Containers =="
@@ -1069,6 +1106,7 @@ EOF
 	if [ "$PMAJOR" -ge 6 ] && [ "$BLOCKERS" -eq 0 ]; then
 		NEEDS_P6_MIGRATE="$HOST_NET_WORK"
 		[ "$P6_CTR_WORK" -gt 0 ] && NEEDS_P6_MIGRATE=1
+		[ "$SVC_MISMATCH" -eq 1 ] && NEEDS_P6_MIGRATE=1
 		if [ "$NEEDS_P6_MIGRATE" -eq 0 ]; then
 			say ""
 			say "  already running on netavark; no unmigrated CNI networks or failed containers"
@@ -1094,6 +1132,9 @@ cmd_check() {
 	set -e
 	if [ "$rc" -eq 2 ]; then
 		exit 0
+	fi
+	if [ "$rc" -eq 0 ] && [ "${SVC_MISMATCH:-0}" -eq 1 ]; then
+		exit 1
 	fi
 	exit "$rc"
 }
@@ -1201,8 +1242,7 @@ cmd_switch() {
 		PODMAN_CONF_OVERRIDE=""
 	fi
 	mkdir -p "$(dirname "$CONF_DROPIN")"
-	DNS53=$(host_53_listener)
-	if [ -n "$DNS53" ]; then
+	if [ "${DNS_NEEDS_CFG:-0}" -eq 1 ]; then
 		cat > "$CONF_DROPIN" <<EOF
 [network]
 network_backend = "netavark"
