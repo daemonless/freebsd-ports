@@ -1,0 +1,1144 @@
+#!/bin/sh
+# netavark-migrate - Migrate a FreeBSD Podman host between CNI and netavark.
+# Preflight check, in-place migration from CNI to netavark, and rollback.
+set -eu
+
+PREFIX="@PREFIX@"
+CNI_DIR="${NETAVARK_MIGRATE_CNI_DIR:-${PREFIX}/etc/cni/net.d}"
+NV_NET_DIR="${NETAVARK_MIGRATE_NV_NET_DIR:-${PREFIX}/etc/containers/networks}"
+CONF_DROPIN="${NETAVARK_MIGRATE_DROPIN:-${PREFIX}/etc/containers/containers.conf.d/50-netavark.conf}"
+STATE_DIR="${NETAVARK_MIGRATE_STATE:-/var/db/netavark-migrate}"
+PF_CONF="${NETAVARK_MIGRATE_PF_CONF:-/etc/pf.conf}"
+SYSCTL_CONF="${NETAVARK_MIGRATE_SYSCTL_CONF:-/etc/sysctl.conf}"
+LOADER_CONF="${NETAVARK_MIGRATE_LOADER_CONF:-/boot/loader.conf}"
+NETAVARK_BIN="${PREFIX}/libexec/podman/netavark"
+AARDVARK_BIN="${PREFIX}/bin/aardvark-dns"
+EPAIR_NV_BIN="${PREFIX}/libexec/netavark/epair"
+FLUA_BIN="/usr/libexec/flua"
+DEFAULT_DNS_BIND_PORT="5300"
+
+usage() {
+	cat <<'EOF'
+Usage: netavark-migrate [check | switch | back]
+
+Subcommands:
+  check    Preflight only (changes nothing). Print network and container plan.
+  switch   Migrate CNI -> netavark in place (default when no argument is given).
+  back     Roll back netavark -> CNI using saved state in /var/db/netavark-migrate.
+EOF
+}
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+
+require_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		err "must run as root"
+		exit 1
+	fi
+}
+
+backend_of() {
+	podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || printf 'unknown'
+}
+
+host_ifaces_csv() {
+	ifconfig -l 2>/dev/null | tr ' ' ','
+}
+
+host_53_listener() {
+	sockstat -46l 2>/dev/null | awk 'NR > 1 && $6 == "*:53" && !seen[$2,$3]++ { printf "%s (pid %s) ", $2, $3 }'
+}
+
+# Pure-Lua JSON parser + migration planners wrapped via flua.
+run_lua() {
+	"$FLUA_BIN" - "$@" <<'LUA'
+local mode = arg[1]
+
+local function trim(s)
+	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function sh_quote(s)
+	return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- Minimal strict JSON parser for CNI conflists and podman inspect output.
+local function json_decode(str)
+	local pos = 1
+	local len = #str
+
+	local function skip_ws()
+		while pos <= len do
+			local b = str:byte(pos)
+			if b == 32 or b == 9 or b == 10 or b == 13 then
+				pos = pos + 1
+			else
+				break
+			end
+		end
+	end
+
+	local parse_val
+
+	local function utf8_char(cp)
+		if cp < 0x80 then
+			return string.char(cp)
+		elseif cp < 0x800 then
+			return string.char(
+				0xC0 + math.floor(cp / 64),
+				0x80 + (cp % 64)
+			)
+		elseif cp < 0x10000 then
+			return string.char(
+				0xE0 + math.floor(cp / 4096),
+				0x80 + (math.floor(cp / 64) % 64),
+				0x80 + (cp % 64)
+			)
+		else
+			return string.char(
+				0xF0 + math.floor(cp / 262144),
+				0x80 + (math.floor(cp / 4096) % 64),
+				0x80 + (math.floor(cp / 64) % 64),
+				0x80 + (cp % 64)
+			)
+		end
+	end
+
+	local escapes = {
+		['"'] = '"', ['\\'] = '\\', ['/'] = '/',
+		b = '\b', f = '\f', n = '\n', r = '\r', t = '\t'
+	}
+
+	local function parse_str()
+		pos = pos + 1
+		local out = {}
+		while pos <= len do
+			local ch = str:sub(pos, pos)
+			if ch == '"' then
+				pos = pos + 1
+				return table.concat(out)
+			elseif ch == '\\' then
+				pos = pos + 1
+				local esc = str:sub(pos, pos)
+				if escapes[esc] then
+					out[#out + 1] = escapes[esc]
+					pos = pos + 1
+				elseif esc == 'u' then
+					local hex = str:sub(pos + 1, pos + 4)
+					local cp = tonumber(hex, 16)
+					if not cp then error("bad unicode escape at " .. pos) end
+					pos = pos + 5
+					if cp >= 0xD800 and cp <= 0xDBFF and str:sub(pos, pos + 1) == '\\u' then
+						local hex2 = str:sub(pos + 2, pos + 5)
+						local cp2 = tonumber(hex2, 16)
+						if cp2 and cp2 >= 0xDC00 and cp2 <= 0xDFFF then
+							cp = 0x10000 + (cp - 0xD800) * 1024 + (cp2 - 0xDC00)
+							pos = pos + 6
+						end
+					end
+					out[#out + 1] = utf8_char(cp)
+				else
+					error("bad escape at " .. pos)
+				end
+			else
+				local nxt = str:find('["\\]', pos)
+				if not nxt then
+					error("unterminated string")
+				end
+				if nxt > pos then
+					out[#out + 1] = str:sub(pos, nxt - 1)
+					pos = nxt
+				else
+					out[#out + 1] = ch
+					pos = pos + 1
+				end
+			end
+		end
+		error("unterminated string")
+	end
+
+	local function parse_num()
+		local s = str:match("^-?%d+%.?%d*[eE]?[+-]?%d*", pos)
+		if not s or s == "" then error("bad number at " .. pos) end
+		pos = pos + #s
+		return tonumber(s)
+	end
+
+	local function parse_arr()
+		pos = pos + 1
+		skip_ws()
+		local arr = {}
+		if str:sub(pos, pos) == ']' then
+			pos = pos + 1
+			return arr
+		end
+		while true do
+			arr[#arr + 1] = parse_val()
+			skip_ws()
+			local ch = str:sub(pos, pos)
+			if ch == ']' then
+				pos = pos + 1
+				return arr
+			elseif ch == ',' then
+				pos = pos + 1
+			else
+				error("expected ',' or ']' at " .. pos)
+			end
+		end
+	end
+
+	local function parse_obj()
+		pos = pos + 1
+		skip_ws()
+		local obj = {}
+		if str:sub(pos, pos) == '}' then
+			pos = pos + 1
+			return obj
+		end
+		while true do
+			skip_ws()
+			if str:sub(pos, pos) ~= '"' then error("expected string key at " .. pos) end
+			local k = parse_str()
+			skip_ws()
+			if str:sub(pos, pos) ~= ':' then error("expected ':' at " .. pos) end
+			pos = pos + 1
+			obj[k] = parse_val()
+			skip_ws()
+			local ch = str:sub(pos, pos)
+			if ch == '}' then
+				pos = pos + 1
+				return obj
+			elseif ch == ',' then
+				pos = pos + 1
+			else
+				error("expected ',' or '}' at " .. pos)
+			end
+		end
+	end
+
+	parse_val = function()
+		skip_ws()
+		local ch = str:sub(pos, pos)
+		if ch == '"' then return parse_str()
+		elseif ch == '{' then return parse_obj()
+		elseif ch == '[' then return parse_arr()
+		elseif ch == 't' and str:sub(pos, pos + 3) == 'true' then pos = pos + 4; return true
+		elseif ch == 'f' and str:sub(pos, pos + 4) == 'false' then pos = pos + 5; return false
+		elseif ch == 'n' and str:sub(pos, pos + 3) == 'null' then pos = pos + 4; return nil
+		else return parse_num()
+		end
+	end
+
+	local val = parse_val()
+	skip_ws()
+	return val
+end
+
+local function read_file(path)
+	local f, e = io.open(path, "r")
+	if not f then return nil, e end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
+local function exec_conflists()
+	local epair_nv = arg[2]
+	local ifaces_csv = arg[3] or ""
+	local ifaces = {}
+	for tok in ifaces_csv:gmatch("[^,]+") do
+		ifaces[tok] = true
+	end
+	local has_epair_nv = false
+	local ef = io.open(epair_nv, "r")
+	if ef then
+		ef:close()
+		has_epair_nv = (os.execute("test -x " .. sh_quote(epair_nv)) == true)
+	end
+
+	for i = 4, #arg do
+		local path = arg[i]
+		local text, rerr = read_file(path)
+		if not text then
+			print("BLOCKER\tcannot read " .. path .. ": " .. tostring(rerr))
+		else
+			local ok, doc = pcall(json_decode, text)
+			if not ok or type(doc) ~= "table" then
+				print("BLOCKER\tinvalid JSON in " .. path .. ": " .. tostring(doc))
+			else
+				local name = doc.name
+				local plugins = doc.plugins or { doc }
+				local main = plugins[1]
+				if not name or type(main) ~= "table" then
+					print("BLOCKER\t" .. path .. " missing name or plugins[1]")
+				else
+					local ptype = tostring(main.type or "")
+					local has_dnsname = false
+					for _, p in ipairs(plugins) do
+						if type(p) == "table" and p.type == "dnsname" then
+							has_dnsname = true
+						end
+					end
+
+					if ptype == "bridge" then
+						local br = tostring(main.bridge or "")
+						if br ~= "" then
+							print("CNIBRIDGE\t" .. br)
+						end
+						local ipam = main.ipam or {}
+						local ranges = ipam.ranges or {}
+						local is_default = (name == "podman")
+						if is_default then
+							local sub = (ranges[1] and ranges[1][1] and ranges[1][1].subnet) or ""
+							if sub == "10.88.0.0/16" or sub == "" then
+								print("INFO\t" .. name .. " -> built-in netavark default network (podman, 10.88.0.0/16)")
+							else
+								print("BLOCKER\t" .. name .. " uses custom default subnet " .. sub .. "; rename before migrating")
+							end
+						elseif ipam.type ~= "host-local" and ipam.type ~= nil then
+							print("BLOCKER\t" .. name .. " (bridge) uses unsupported IPAM driver '" .. tostring(ipam.type) .. "'")
+						else
+							local cmd = { "podman", "network", "create" }
+							if not has_dnsname then
+								cmd[#cmd + 1] = "--disable-dns"
+							end
+							if main.isGateway == false and main.ipMasq == false then
+								cmd[#cmd + 1] = "--internal"
+							end
+							if main.mtu then
+								cmd[#cmd + 1] = "-o"
+								cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
+							end
+							local has_v6 = false
+							local ip_flags = {}
+							for _, grp in ipairs(ranges) do
+								if type(grp) == "table" then
+									for _, r in ipairs(grp) do
+										if type(r) == "table" and r.subnet then
+											local sub = tostring(r.subnet)
+											if sub:find(":", 1, true) then has_v6 = true end
+											ip_flags[#ip_flags + 1] = "--subnet"
+											ip_flags[#ip_flags + 1] = sub
+											if r.gateway and r.gateway ~= "" then
+												ip_flags[#ip_flags + 1] = "--gateway"
+												ip_flags[#ip_flags + 1] = tostring(r.gateway)
+											end
+											if r.rangeStart and r.rangeEnd and r.rangeStart ~= "" and r.rangeEnd ~= "" then
+												ip_flags[#ip_flags + 1] = "--ip-range"
+												ip_flags[#ip_flags + 1] = tostring(r.rangeStart) .. "-" .. tostring(r.rangeEnd)
+											end
+										end
+									end
+								end
+							end
+							if has_v6 then cmd[#cmd + 1] = "--ipv6" end
+							for _, f in ipairs(ip_flags) do cmd[#cmd + 1] = f end
+							cmd[#cmd + 1] = name
+							local q = {}
+							for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
+							local cmd_str = table.concat(q, " ")
+							local plain_str = table.concat(cmd, " ")
+							print("CREATE\t" .. name .. "\tbridge" .. "\t" .. cmd_str)
+							print("INFO\t" .. name .. " (CNI bridge -> netavark bridge): " .. plain_str)
+						end
+					elseif ptype == "epair" then
+						local master = tostring(main.master or main.bridge or "")
+						local ipam = main.ipam or {}
+						local itype = tostring(ipam.type or "host-local")
+						if master == "" then
+							print("BLOCKER\t" .. name .. " (epair) has no master bridge configured")
+						elseif not ifaces[master] then
+							print("BLOCKER\t" .. name .. " (epair) host bridge '" .. master .. "' does not exist")
+						elseif itype == "dhcp" then
+							if not has_epair_nv then
+								print("BLOCKER\t" .. name .. " (epair DHCP) requires " .. epair_nv .. " (cni-epair with netavark mode)")
+							else
+								local cmd = {
+									"podman", "network", "create", "--disable-dns",
+									"-d", "epair", "--ipam-driver", "none",
+									"-o", "master=" .. master
+								}
+								if main.mtu then
+									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
+								end
+								if main.vlan then
+									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "vlan=" .. tostring(main.vlan)
+								end
+								if main.taggedVlans then
+									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "taggedVlans=" .. tostring(main.taggedVlans)
+								end
+								cmd[#cmd + 1] = name
+								local q = {}
+								for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
+								print("CREATE\t" .. name .. "\tepair-dhcp\t" .. table.concat(q, " "))
+								print("INFO\t" .. name .. " (CNI epair DHCP -> netavark epair plugin): " .. table.concat(cmd, " "))
+							end
+						elseif itype == "host-local" then
+							if main.vlan or main.taggedVlans then
+								print("BLOCKER\t" .. name .. " (epair host-local with vlan/taggedVlans) has no netavark VLAN bridge mapping yet")
+							else
+								local cmd = {
+									"podman", "network", "create", "--disable-dns",
+									"-d", "bridge", "-o", "mode=unmanaged",
+									"--interface-name", master
+								}
+								if main.mtu then
+									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
+								end
+								local has_v6 = false
+								local ip_flags = {}
+								local ranges = ipam.ranges or {}
+								for _, grp in ipairs(ranges) do
+									if type(grp) == "table" then
+										for _, r in ipairs(grp) do
+											if type(r) == "table" and r.subnet then
+												local sub = tostring(r.subnet)
+												if sub:find(":", 1, true) then has_v6 = true end
+												ip_flags[#ip_flags + 1] = "--subnet"
+												ip_flags[#ip_flags + 1] = sub
+												if r.gateway and r.gateway ~= "" then
+													ip_flags[#ip_flags + 1] = "--gateway"
+													ip_flags[#ip_flags + 1] = tostring(r.gateway)
+												end
+												if r.rangeStart and r.rangeEnd and r.rangeStart ~= "" and r.rangeEnd ~= "" then
+													ip_flags[#ip_flags + 1] = "--ip-range"
+													ip_flags[#ip_flags + 1] = tostring(r.rangeStart) .. "-" .. tostring(r.rangeEnd)
+												end
+											end
+										end
+									end
+								end
+								if has_v6 then cmd[#cmd + 1] = "--ipv6" end
+								for _, f in ipairs(ip_flags) do cmd[#cmd + 1] = f end
+								cmd[#cmd + 1] = name
+								local q = {}
+								for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
+								print("CREATE\t" .. name .. "\tepair-unmanaged\t" .. table.concat(q, " "))
+								print("INFO\t" .. name .. " (CNI epair host-local -> unmanaged bridge on " .. master .. "): " .. table.concat(cmd, " "))
+							end
+						else
+							print("BLOCKER\t" .. name .. " (epair) uses unsupported IPAM driver '" .. itype .. "'")
+						end
+					else
+						print("BLOCKER\t" .. name .. " uses unsupported CNI plugin '" .. ptype .. "'")
+					end
+				end
+			end
+		end
+	end
+end
+
+local function extract_pins(create_cmd)
+	local pins = {}
+	if type(create_cmd) ~= "table" then return pins end
+	local i = 1
+	while i <= #create_cmd do
+		local a = tostring(create_cmd[i])
+		if a == "--ip" and create_cmd[i + 1] then
+			pins[#pins + 1] = "ip=" .. tostring(create_cmd[i + 1])
+			i = i + 2
+		elseif a:match("^%-%-ip=") then
+			pins[#pins + 1] = "ip=" .. a:sub(6)
+			i = i + 1
+		elseif a == "--ip6" and create_cmd[i + 1] then
+			pins[#pins + 1] = "ip6=" .. tostring(create_cmd[i + 1])
+			i = i + 2
+		elseif a:match("^%-%-ip6=") then
+			pins[#pins + 1] = "ip6=" .. a:sub(7)
+			i = i + 1
+		elseif a == "--mac-address" and create_cmd[i + 1] then
+			pins[#pins + 1] = "mac=" .. tostring(create_cmd[i + 1])
+			i = i + 2
+		elseif a:match("^%-%-mac%-address=") then
+			pins[#pins + 1] = "mac=" .. a:sub(15)
+			i = i + 1
+		else
+			i = i + 1
+		end
+	end
+	return pins
+end
+
+local function exec_containers()
+	local inspect_path = arg[2]
+	local running_path = arg[3] or ""
+	local recreate_path = arg[4] or ""
+	local text, rerr = read_file(inspect_path)
+	if not text or trim(text) == "" then
+		return
+	end
+	local arr = json_decode(text)
+	if type(arr) ~= "table" then error("inspect output is not an array") end
+
+	local run_lines = {}
+	local rec_lines = { "#!/bin/sh", "# Captured pre-migration container run commands (fallback only)" }
+
+	for _, c in ipairs(arr) do
+		local name = tostring(c.Name or "")
+		local state = (c.State and c.State.Running) and "running" or "stopped"
+		local net_map = (c.NetworkSettings and c.NetworkSettings.Networks) or {}
+		local nets = {}
+		local live = {}
+		for k, v in pairs(net_map) do
+			nets[#nets + 1] = k
+			if type(v) == "table" then
+				local parts = {}
+				if v.IPAddress and v.IPAddress ~= "" then parts[#parts + 1] = v.IPAddress end
+				if v.MacAddress and v.MacAddress ~= "" then parts[#parts + 1] = v.MacAddress end
+				if #parts > 0 then
+					live[#live + 1] = k .. ":" .. table.concat(parts, "/")
+				end
+			end
+		end
+		table.sort(nets)
+		table.sort(live)
+
+		local pins = extract_pins(c.Config and c.Config.CreateCommand)
+		local note_parts = {}
+		if #pins > 0 then note_parts[#note_parts + 1] = "pinned(" .. table.concat(pins, ",") .. ")" end
+		if #live > 0 then note_parts[#note_parts + 1] = "live(" .. table.concat(live, ";") .. ")" end
+		local note = #note_parts > 0 and table.concat(note_parts, " ") or "pool"
+
+		local action = (state == "running")
+			and "stop on CNI -> carry over in place -> start on netavark"
+			or "keep stopped in place"
+		print(string.format("CTR\t%s\t%s\t%s\t%s\t%s",
+			name, state, #nets > 0 and table.concat(nets, ",") or "none", note, action))
+
+		if state == "running" then
+			run_lines[#run_lines + 1] = name
+		end
+		local cc = c.Config and c.Config.CreateCommand
+		if type(cc) == "table" and #cc > 0 then
+			local q = {}
+			for _, tok in ipairs(cc) do q[#q + 1] = sh_quote(tok) end
+			rec_lines[#rec_lines + 1] = "# " .. name
+			rec_lines[#rec_lines + 1] = table.concat(q, " ")
+		end
+	end
+
+	if running_path ~= "" then
+		local rf = assert(io.open(running_path, "w"))
+		if #run_lines > 0 then rf:write(table.concat(run_lines, "\n") .. "\n") end
+		rf:close()
+	end
+	if recreate_path ~= "" then
+		local cf = assert(io.open(recreate_path, "w"))
+		cf:write(table.concat(rec_lines, "\n") .. "\n")
+		cf:close()
+	end
+end
+
+local function first_kw(line)
+	if line:match("^%s*$") or line:match("^%s*#") then return nil end
+	return line:match("^%s*([%a%-]+)")
+end
+
+local function exec_pf()
+	local pf_action = arg[2]
+	local pf_path = arg[3]
+	local out_path = arg[4] or ""
+	local text, rerr = read_file(pf_path)
+	if not text then
+		print("MISSING\t" .. tostring(rerr))
+		return
+	end
+
+	local lines = {}
+	for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+		lines[#lines + 1] = line
+	end
+	if #lines > 0 and lines[#lines] == "" then
+		table.remove(lines)
+	end
+
+	local has_sub, has_iso, has_nat, has_rdr, has_flt = false, false, false, false, false
+	for _, line in ipairs(lines) do
+		if not line:match("^%s*#") then
+			if line:match("^%s*table%s+<netavark%-subnets>") then has_sub = true end
+			if line:match("^%s*table%s+<netavark%-isolated>") then has_iso = true end
+			if line:match('^%s*nat%-anchor%s+"netavark/%*"') then has_nat = true end
+			if line:match('^%s*rdr%-anchor%s+"netavark/%*"') then has_rdr = true end
+			if line:match('^%s*anchor%s+"netavark/%*"') then has_flt = true end
+		end
+	end
+
+	local missing = {}
+	if not has_sub then missing[#missing + 1] = "table <netavark-subnets> persist" end
+	if not has_iso then missing[#missing + 1] = "table <netavark-isolated> persist" end
+	if not has_nat then missing[#missing + 1] = 'nat-anchor "netavark/*"' end
+	if not has_rdr then missing[#missing + 1] = 'rdr-anchor "netavark/*"' end
+	if not has_flt then missing[#missing + 1] = 'anchor "netavark/*"' end
+
+	if pf_action == "check" then
+		if #missing == 0 then
+			print("OK\tall netavark tables and anchors present in " .. pf_path)
+		else
+			print("MISSING\t" .. table.concat(missing, "; "))
+		end
+		return
+	end
+
+	if #missing == 0 then
+		print("UNCHANGED")
+		return
+	end
+
+	local tbl_kws = {
+		scrub = true, altq = true, queue = true,
+		nat = true, rdr = true, binat = true,
+		["nat-anchor"] = true, ["rdr-anchor"] = true, ["binat-anchor"] = true,
+		antispoof = true, anchor = true, block = true, pass = true
+	}
+	local flt_kws = {
+		antispoof = true, anchor = true, block = true, pass = true
+	}
+
+	local to_tbl = {}
+	if not has_sub then to_tbl[#to_tbl + 1] = "table <netavark-subnets> persist" end
+	if not has_iso then to_tbl[#to_tbl + 1] = "table <netavark-isolated> persist" end
+
+	if #to_tbl > 0 then
+		local idx = #lines + 1
+		for i, line in ipairs(lines) do
+			local kw = first_kw(line)
+			if kw and tbl_kws[kw] then
+				idx = i
+				break
+			end
+		end
+		for j = #to_tbl, 1, -1 do
+			table.insert(lines, idx, to_tbl[j])
+		end
+	end
+
+	local to_xlate = {}
+	if not has_nat then to_xlate[#to_xlate + 1] = 'nat-anchor "netavark/*"' end
+	if not has_rdr then to_xlate[#to_xlate + 1] = 'rdr-anchor "netavark/*"' end
+
+	if #to_xlate > 0 then
+		local idx = #lines + 1
+		for i, line in ipairs(lines) do
+			local kw = first_kw(line)
+			if kw and flt_kws[kw] then
+				idx = i
+				break
+			end
+		end
+		for j = #to_xlate, 1, -1 do
+			table.insert(lines, idx, to_xlate[j])
+		end
+	end
+
+	if not has_flt then
+		lines[#lines + 1] = 'anchor "netavark/*"'
+	end
+
+	local of = assert(io.open(out_path, "w"))
+	of:write(table.concat(lines, "\n") .. "\n")
+	of:close()
+	print("UPDATED\t" .. table.concat(missing, "; "))
+end
+
+if mode == "conflists" then
+	exec_conflists()
+elseif mode == "containers" then
+	exec_containers()
+elseif mode == "pf" then
+	exec_pf()
+else
+	error("unknown lua mode: " .. tostring(mode))
+end
+LUA
+}
+
+collect_conflist_files() {
+	CONFLIST_ARGS=""
+	if [ -d "$CNI_DIR" ]; then
+		for f in "$CNI_DIR"/*.conflist "$CNI_DIR"/*.conf; do
+			[ -f "$f" ] || continue
+			CONFLIST_ARGS="${CONFLIST_ARGS} $f"
+		done
+	fi
+}
+
+run_preflight() {
+	BLOCKERS=0
+	WARNINGS=0
+	PLAN_CREATE_FILE="$1"
+	PLAN_BRIDGES_FILE="$2"
+	PLAN_RUN_FILE="$3"
+	PLAN_RECREATE_FILE="$4"
+	PLAN_INSPECT_FILE="$5"
+
+	: > "$PLAN_CREATE_FILE"
+	: > "$PLAN_BRIDGES_FILE"
+	: > "$PLAN_RUN_FILE"
+
+	say "== Host checks =="
+	BACKEND=$(backend_of)
+	say "  backend: $BACKEND"
+	if [ "$BACKEND" = "netavark" ]; then
+		say "  already running on netavark"
+		if [ -d "$STATE_DIR" ]; then
+			say "  rollback state present in $STATE_DIR (run 'netavark-migrate back' to return to CNI)"
+		fi
+		return 2
+	fi
+	if [ "$BACKEND" != "cni" ]; then
+		err "unexpected Podman network backend '$BACKEND'"
+		BLOCKERS=$((BLOCKERS + 1))
+	fi
+
+	if [ -x "$NETAVARK_BIN" ]; then
+		say "  netavark binary: ok ($NETAVARK_BIN)"
+	else
+		err "blocker: netavark binary missing at $NETAVARK_BIN"
+		BLOCKERS=$((BLOCKERS + 1))
+	fi
+
+	if [ -x "$AARDVARK_BIN" ]; then
+		say "  aardvark-dns binary: ok ($AARDVARK_BIN)"
+	else
+		err "blocker: aardvark-dns binary missing at $AARDVARK_BIN"
+		BLOCKERS=$((BLOCKERS + 1))
+	fi
+
+	INOTIFY=$(sysctl -n vfs.inotify.max_user_instances 2>/dev/null || printf 'unknown')
+	AARD_VER=$(pkg query '%v' aardvark-dns 2>/dev/null || printf 'unknown')
+	if [ "$INOTIFY" = "-1" ]; then
+		if [ "$AARD_VER" != "unknown" ] && [ "$(pkg version -t "$AARD_VER" "2.1.0_3")" != "<" ]; then
+			warn "vfs.inotify.max_user_instances=-1 (covered by aardvark-dns $AARD_VER patch; default is 256)"
+			WARNINGS=$((WARNINGS + 1))
+		else
+			err "blocker: vfs.inotify.max_user_instances=-1 causes aardvark-dns ($AARD_VER) to abort; set sysctl vfs.inotify.max_user_instances=256 or upgrade aardvark-dns >= 2.1.0_3"
+			BLOCKERS=$((BLOCKERS + 1))
+		fi
+	else
+		say "  vfs.inotify.max_user_instances: $INOTIFY (ok)"
+	fi
+
+	if [ ! -f "$PF_CONF" ]; then
+		err "blocker: $PF_CONF not found"
+		BLOCKERS=$((BLOCKERS + 1))
+	elif ! pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+		err "blocker: pf is not enabled (enable pf before migrating)"
+		BLOCKERS=$((BLOCKERS + 1))
+	else
+		PF_STATUS=$(run_lua pf check "$PF_CONF")
+		case "$PF_STATUS" in
+			OK*)
+				say "  pf: enabled; ${PF_STATUS#OK	}"
+				;;
+			MISSING*)
+				say "  pf: enabled; will add to $PF_CONF: ${PF_STATUS#MISSING	}"
+				;;
+		esac
+	fi
+
+	FILTER_LOCAL=$(sysctl -n net.pf.filter_local 2>/dev/null || printf '0')
+	if [ "$FILTER_LOCAL" = "1" ]; then
+		say "  net.pf.filter_local: 1 (ok)"
+	else
+		say "  net.pf.filter_local: $FILTER_LOCAL -> will set 1, add to $SYSCTL_CONF, pf_load=YES in $LOADER_CONF, and reload pf"
+	fi
+
+	IP_FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || printf '0')
+	if [ "$IP_FWD" = "1" ]; then
+		say "  net.inet.ip.forwarding: 1 (ok)"
+	else
+		say "  net.inet.ip.forwarding: $IP_FWD -> will set 1 and gateway_enable=YES"
+	fi
+
+	DNS53=$(host_53_listener)
+	if [ -n "$DNS53" ]; then
+		say "  *:53 listener: $DNS53-> will set dns_bind_port = $DEFAULT_DNS_BIND_PORT in $CONF_DROPIN"
+	else
+		say "  *:53 listener: none (aardvark-dns will bind <gateway>:53)"
+	fi
+
+	if ! mount 2>/dev/null | grep -q ' on /dev/fd '; then
+		warn "/dev/fd (fdescfs) is not mounted; container restart policies require fdescfs"
+		WARNINGS=$((WARNINGS + 1))
+	fi
+
+	say ""
+	say "== Networks ($CNI_DIR) =="
+	collect_conflist_files
+	if [ -z "$CONFLIST_ARGS" ]; then
+		say "  none (built-in default podman network only)"
+	else
+		IFACES=$(host_ifaces_csv)
+		# shellcheck disable=SC2086
+		NET_PLAN=$(run_lua conflists "$EPAIR_NV_BIN" "$IFACES" $CONFLIST_ARGS)
+		OLDIFS=$IFS
+		IFS='
+'
+		for line in $NET_PLAN; do
+			tag=${line%%	*}
+			rest=${line#*	}
+			case "$tag" in
+				INFO)
+					say "  $rest"
+					;;
+				CREATE)
+					printf '%s\n' "$rest" >> "$PLAN_CREATE_FILE"
+					;;
+				CNIBRIDGE)
+					printf '%s\n' "$rest" >> "$PLAN_BRIDGES_FILE"
+					;;
+				BLOCKER)
+					err "blocker: $rest"
+					BLOCKERS=$((BLOCKERS + 1))
+					;;
+			esac
+		done
+		IFS=$OLDIFS
+	fi
+
+	say ""
+	say "== Containers =="
+	CIDS=$(podman ps -aq 2>/dev/null || true)
+	if [ -z "$CIDS" ]; then
+		say "  none"
+		: > "$PLAN_INSPECT_FILE"
+	else
+		# shellcheck disable=SC2086
+		podman container inspect $CIDS > "$PLAN_INSPECT_FILE"
+		CTR_PLAN=$(run_lua containers "$PLAN_INSPECT_FILE" "$PLAN_RUN_FILE" "$PLAN_RECREATE_FILE")
+		OLDIFS=$IFS
+		IFS='
+'
+		for line in $CTR_PLAN; do
+			tag=${line%%	*}
+			rest=${line#*	}
+			if [ "$tag" = "CTR" ]; then
+				name=$(printf '%s' "$rest" | cut -f1)
+				state=$(printf '%s' "$rest" | cut -f2)
+				nets=$(printf '%s' "$rest" | cut -f3)
+				note=$(printf '%s' "$rest" | cut -f4)
+				action=$(printf '%s' "$rest" | cut -f5)
+				say "  $name ($state): nets=[$nets] $note -> $action"
+			fi
+		done
+		IFS=$OLDIFS
+	fi
+
+	say ""
+	say "== Summary =="
+	say "  blockers: $BLOCKERS, warnings: $WARNINGS"
+	if [ "$BLOCKERS" -gt 0 ]; then
+		return 1
+	fi
+	return 0
+}
+
+cmd_check() {
+	TMPD=$(mktemp -d /tmp/netavark-migrate-check.XXXXXX)
+	trap 'rm -rf "$TMPD"' EXIT
+	set +e
+	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect"
+	rc=$?
+	set -e
+	if [ "$rc" -eq 2 ]; then
+		exit 0
+	fi
+	exit "$rc"
+}
+
+cmd_switch() {
+	require_root
+	TMPD=$(mktemp -d /tmp/netavark-migrate-run.XXXXXX)
+	trap 'rm -rf "$TMPD"' EXIT
+
+	set +e
+	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect"
+	rc=$?
+	set -e
+	if [ "$rc" -eq 2 ]; then
+		say "Nothing to do: already on netavark."
+		exit 0
+	elif [ "$rc" -ne 0 ]; then
+		err "preflight failed; host left unchanged"
+		exit 1
+	fi
+
+	say ""
+	say "== Migrating CNI -> netavark =="
+
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
+	rm -rf "$STATE_DIR/cni-net.d"
+	mkdir -p "$STATE_DIR/cni-net.d"
+	cp "$TMPD/running" "$STATE_DIR/running-containers.txt"
+	cp "$TMPD/inspect" "$STATE_DIR/containers-inspect.json"
+	if [ -f "$TMPD/recreate" ]; then
+		cp "$TMPD/recreate" "$STATE_DIR/recreate-commands.sh"
+		chmod 700 "$STATE_DIR/recreate-commands.sh"
+	fi
+	cp "$PF_CONF" "$STATE_DIR/pf.conf.pre-netavark"
+
+	# 1. Stop running containers while still on CNI so CNI tears down leases/epairs cleanly.
+	if [ -s "$STATE_DIR/running-containers.txt" ]; then
+		RUN_LIST=$(tr '\n' ' ' < "$STATE_DIR/running-containers.txt")
+		say "  stopping running containers on CNI: $RUN_LIST"
+		# shellcheck disable=SC2086
+		podman stop -t 10 $RUN_LIST >/dev/null
+	fi
+
+	# 2. Stop leftover CNI dnsname dnsmasq and destroy CNI bridges (cni-podman* and conflist bridge names).
+	pkill -f '/cni/dnsname/' 2>/dev/null || true
+	ALL_CNI_BRIDGES=$( { ifconfig -l | tr ' ' '\n' | grep '^cni-podman' || true; cat "$TMPD/bridges"; } | sort -u )
+	for br in $ALL_CNI_BRIDGES; do
+		if ifconfig "$br" >/dev/null 2>&1; then
+			say "  destroying CNI bridge $br"
+			ifconfig "$br" destroy
+		fi
+	done
+
+	# 3. Back up and move CNI conflists out of cni/net.d.
+	collect_conflist_files
+	if [ -n "$CONFLIST_ARGS" ]; then
+		# shellcheck disable=SC2086
+		for f in $CONFLIST_ARGS; do
+			mv "$f" "$STATE_DIR/cni-net.d/"
+		done
+	fi
+
+	# 4. Write containers.conf drop-in and confirm netavark backend.
+	mkdir -p "$(dirname "$CONF_DROPIN")"
+	DNS53=$(host_53_listener)
+	if [ -n "$DNS53" ]; then
+		cat > "$CONF_DROPIN" <<EOF
+[network]
+network_backend = "netavark"
+dns_bind_port = $DEFAULT_DNS_BIND_PORT
+EOF
+		say "  wrote $CONF_DROPIN (network_backend=netavark, dns_bind_port=$DEFAULT_DNS_BIND_PORT)"
+	else
+		cat > "$CONF_DROPIN" <<'EOF'
+[network]
+network_backend = "netavark"
+EOF
+		say "  wrote $CONF_DROPIN (network_backend=netavark)"
+	fi
+
+	if service podman_service status >/dev/null 2>&1; then
+		say "  restarting podman_service"
+		service podman_service restart >/dev/null
+	fi
+
+	NEW_BACKEND=$(backend_of)
+	if [ "$NEW_BACKEND" != "netavark" ]; then
+		err "Podman reports backend '$NEW_BACKEND' instead of 'netavark'"
+		exit 1
+	fi
+
+	# 5. Configure sysctls and pf.conf for netavark.
+	if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || printf 0)" != "1" ]; then
+		sysctl net.inet.ip.forwarding=1 >/dev/null
+	fi
+	sysrc gateway_enable=YES >/dev/null
+	sysrc -f "$LOADER_CONF" pf_load=YES >/dev/null
+	if [ ! -f "$SYSCTL_CONF" ] || ! grep -q '^net\.pf\.filter_local=' "$SYSCTL_CONF"; then
+		printf '\nnet.pf.filter_local=1\n' >> "$SYSCTL_CONF"
+	fi
+
+	PF_MOD=$(run_lua pf update "$PF_CONF" "$TMPD/pf.conf.new")
+	case "$PF_MOD" in
+		UPDATED*)
+			pfctl -nf "$TMPD/pf.conf.new"
+			cp "$TMPD/pf.conf.new" "$PF_CONF"
+			say "  updated $PF_CONF (${PF_MOD#UPDATED	})"
+			;;
+	esac
+
+	FILTER_LOCAL=$(sysctl -n net.pf.filter_local 2>/dev/null || printf '0')
+	if [ "$FILTER_LOCAL" != "1" ]; then
+		sysctl net.pf.filter_local=1 >/dev/null
+		pfctl -d 2>/dev/null || true
+		pfctl -e -f "$PF_CONF"
+		say "  enabled net.pf.filter_local=1 and reloaded pf"
+	else
+		pfctl -f "$PF_CONF"
+	fi
+
+	# 6. Recreate custom networks under netavark.
+	FAILURES=0
+	if [ -s "$TMPD/create" ]; then
+		OLDIFS=$IFS
+		IFS='
+'
+		for row in $(cat "$TMPD/create"); do
+			IFS=$OLDIFS
+			net_name=$(printf '%s' "$row" | cut -f1)
+			net_kind=$(printf '%s' "$row" | cut -f2)
+			net_cmd=$(printf '%s' "$row" | cut -f3-)
+			say "  creating network $net_name ($net_kind)"
+			if ! eval "$net_cmd" >/dev/null; then
+				err "failed to create network $net_name"
+				FAILURES=$((FAILURES + 1))
+			fi
+		done
+		IFS=$OLDIFS
+	fi
+
+	# 7. Start containers in place.
+	if [ -s "$STATE_DIR/running-containers.txt" ]; then
+		for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+			say "  starting container $cname"
+			if ! podman start "$cname" >/dev/null; then
+				err "failed to start container $cname (fallback run command in $STATE_DIR/recreate-commands.sh)"
+				FAILURES=$((FAILURES + 1))
+			fi
+		done
+	fi
+
+	say ""
+	say "== Verification =="
+	say "  backend: $(backend_of)"
+	say "  net.pf.filter_local: $(sysctl -n net.pf.filter_local 2>/dev/null || printf unknown)"
+	say "  networks: $(podman network ls --format '{{.Name}}({{.Driver}})' | tr '\n' ' ')"
+	if [ -s "$STATE_DIR/running-containers.txt" ]; then
+		for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+			st=$(podman inspect --format '{{.State.Running}}' "$cname" 2>/dev/null || printf false)
+			jid=$(podman inspect --format '{{.State.Pid}}' "$cname" 2>/dev/null || printf '')
+			ips=""
+			if [ "$st" = "true" ]; then
+				ips=$(podman exec "$cname" ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" { printf "%s ", $2 }' || true)
+			else
+				FAILURES=$((FAILURES + 1))
+			fi
+			say "  container $cname: running=$st ips=[${ips% }]"
+		done
+	fi
+	say "  rollback saved under $STATE_DIR (use 'netavark-migrate back' to revert to CNI)"
+
+	if [ "$FAILURES" -gt 0 ]; then
+		err "completed with $FAILURES failure(s)"
+		exit 1
+	fi
+	say "Migration complete."
+}
+
+cmd_back() {
+	require_root
+	if [ ! -d "$STATE_DIR" ]; then
+		err "no migration state found in $STATE_DIR"
+		exit 1
+	fi
+
+	say "== Rolling back netavark -> CNI =="
+	CUR_RUNNING=$(podman ps --format '{{.Names}}' 2>/dev/null || true)
+	printf '%s\n' "$CUR_RUNNING" | sed '/^$/d' > "$STATE_DIR/running-containers-back.txt"
+
+	# 1. Stop running containers under netavark so aardvark/pf teardown runs cleanly.
+	if [ -s "$STATE_DIR/running-containers-back.txt" ]; then
+		RUN_LIST=$(tr '\n' ' ' < "$STATE_DIR/running-containers-back.txt")
+		say "  stopping running containers on netavark: $RUN_LIST"
+		# shellcheck disable=SC2086
+		podman stop -t 10 $RUN_LIST >/dev/null
+	fi
+
+	# 2. Stop aardvark-dns and destroy netavark podman[0-9]* bridges.
+	pkill -x aardvark-dns 2>/dev/null || true
+	for br in $(ifconfig -l | tr ' ' '\n' | grep '^podman[0-9]'); do
+		if ifconfig "$br" >/dev/null 2>&1; then
+			say "  destroying netavark bridge $br"
+			ifconfig "$br" destroy
+		fi
+	done
+
+	# 3. Back up netavark network JSONs without `podman network rm` (which deletes or refuses containers).
+	rm -rf "$STATE_DIR/netavark-networks.bak"
+	mkdir -p "$STATE_DIR/netavark-networks.bak"
+	if [ -d "$NV_NET_DIR" ]; then
+		for j in "$NV_NET_DIR"/*.json; do
+			[ -f "$j" ] || continue
+			mv "$j" "$STATE_DIR/netavark-networks.bak/"
+		done
+	fi
+
+	# 4. Restore CNI conflists and remove drop-in.
+	if [ -d "$STATE_DIR/cni-net.d" ]; then
+		mkdir -p "$CNI_DIR"
+		for f in "$STATE_DIR/cni-net.d"/*; do
+			[ -f "$f" ] || continue
+			mv "$f" "$CNI_DIR/"
+		done
+	fi
+
+	rm -f "$CONF_DROPIN"
+	if service podman_service status >/dev/null 2>&1; then
+		say "  restarting podman_service"
+		service podman_service restart >/dev/null
+	fi
+
+	BACK=$(backend_of)
+	if [ "$BACK" != "cni" ]; then
+		err "expected backend 'cni' after removing $CONF_DROPIN, got '$BACK'"
+		exit 1
+	fi
+
+	# 5. Restart containers under CNI.
+	START_FILE="$STATE_DIR/running-containers-back.txt"
+	[ -s "$START_FILE" ] || START_FILE="$STATE_DIR/running-containers.txt"
+
+	FAILURES=0
+	if [ -s "$START_FILE" ]; then
+		for cname in $(cat "$START_FILE"); do
+			say "  starting container $cname on CNI"
+			if ! podman start "$cname" >/dev/null; then
+				err "failed to start container $cname on CNI"
+				FAILURES=$((FAILURES + 1))
+			fi
+		done
+	fi
+
+	say ""
+	say "== Rollback verification =="
+	say "  backend: $(backend_of)"
+	say "  networks: $(podman network ls --format '{{.Name}}({{.Driver}})' | tr '\n' ' ')"
+	if [ -s "$START_FILE" ]; then
+		for cname in $(cat "$START_FILE"); do
+			st=$(podman inspect --format '{{.State.Running}}' "$cname" 2>/dev/null || printf false)
+			ips=""
+			if [ "$st" = "true" ]; then
+				ips=$(podman exec "$cname" ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" { printf "%s ", $2 }' || true)
+			else
+				FAILURES=$((FAILURES + 1))
+			fi
+			say "  container $cname: running=$st ips=[${ips% }]"
+		done
+	fi
+	say "  pre-migration pf.conf copy kept at $STATE_DIR/pf.conf.pre-netavark"
+
+	if [ "$FAILURES" -gt 0 ]; then
+		err "rollback completed with $FAILURES failure(s)"
+		exit 1
+	fi
+	say "Rollback complete."
+}
+
+ACTION="${1:-switch}"
+case "$ACTION" in
+	check)
+		cmd_check
+		;;
+	switch)
+		cmd_switch
+		;;
+	back)
+		cmd_back
+		;;
+	-h|--help|help)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac

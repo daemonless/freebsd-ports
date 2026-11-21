@@ -1,0 +1,7 @@
+Netavark is a network stack for containers. Podman uses it to create
+bridge networks, connect containers to them, publish ports and run
+aardvark-dns for container name resolution.
+
+On FreeBSD a container's network namespace is a VNET jail, containers
+attach to an if_bridge through epair interfaces, and the firewall rules
+for NAT, published ports and network isolation are pf anchors.

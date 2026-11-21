@@ -1,0 +1,66 @@
+[
+{ type: install
+  message: <<EOM
+Installing netavark does not change your active Podman setup: CNI remains
+the default in Podman 5 and continues to work as before (Podman 6 uses
+netavark by default).
+
+netavark is opt-in on Podman 5. Opting in gives containers name
+resolution via aardvark-dns, isolated custom networks, and automatic pf
+anchors. Existing CNI custom networks must be recreated before starting
+containers under netavark. To check readiness or migrate an existing CNI
+host, run:
+
+  # /usr/local/sbin/netavark-migrate check
+  # /usr/local/sbin/netavark-migrate
+
+Or opt in manually after configuring pf below by creating
+/usr/local/etc/containers/containers.conf.d/50-netavark.conf:
+
+  [network]
+  network_backend = "netavark"
+
+To switch back to CNI, run `/usr/local/sbin/netavark-migrate back` (or
+remove that file and restore your CNI conflists and containers).
+
+netavark keeps its pf rules in anchors under "netavark/". pf must be
+enabled, and /etc/pf.conf must declare the tables and include the
+anchors:
+
+  table <netavark-subnets> persist
+  table <netavark-isolated> persist
+  nat-anchor "netavark/*"
+  rdr-anchor "netavark/*"
+  anchor "netavark/*"
+
+To reach published ports through the host's own addresses, including
+127.0.0.1, set this before pf is enabled:
+
+  # sysctl net.pf.filter_local=1
+  # echo net.pf.filter_local=1 >> /etc/sysctl.conf
+  # sysrc -f /boot/loader.conf pf_load=YES
+
+pf_load makes the setting apply at boot: sysctl.conf is read before
+the pf module would otherwise be loaded.
+
+If a host resolver binds *:53 (dnsmasq, unbound), aardvark-dns cannot
+bind and podman reports "aardvark-dns failed to start". Set dns_bind_port
+under [network] in containers.conf before starting containers so pf
+redirects each gateway's port 53 (if changed while containers run, stop
+aardvark-dns and restart containers that use DNS):
+
+  [network]
+  dns_bind_port = 5300
+
+aardvark-dns 2.1.0 needs inotify (vfs.inotify.max_user_instances 0 or
+higher, default 256).
+
+After "service pf restart" or "pfctl -F all", restore the rules of
+running containers with:
+
+  /usr/local/libexec/podman/netavark firewall-reload
+
+See netavark-pf(7).
+EOM
+}
+]
