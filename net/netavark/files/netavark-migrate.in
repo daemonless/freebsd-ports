@@ -7,7 +7,9 @@ PREFIX="@PREFIX@"
 CNI_DIR="${NETAVARK_MIGRATE_CNI_DIR:-${PREFIX}/etc/cni/net.d}"
 NV_NET_DIR="${NETAVARK_MIGRATE_NV_NET_DIR:-${PREFIX}/etc/containers/networks}"
 CONF_DROPIN="${NETAVARK_MIGRATE_DROPIN:-${PREFIX}/etc/containers/containers.conf.d/50-netavark.conf}"
+CONTAINERS_CONF_DIR="${NETAVARK_MIGRATE_CONF_DIR:-${PREFIX}/etc/containers}"
 STATE_DIR="${NETAVARK_MIGRATE_STATE:-/var/db/netavark-migrate}"
+CNI_EPAIR_STATE_DIR="${NETAVARK_MIGRATE_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
 PF_CONF="${NETAVARK_MIGRATE_PF_CONF:-/etc/pf.conf}"
 SYSCTL_CONF="${NETAVARK_MIGRATE_SYSCTL_CONF:-/etc/sysctl.conf}"
 LOADER_CONF="${NETAVARK_MIGRATE_LOADER_CONF:-/boot/loader.conf}"
@@ -16,6 +18,7 @@ AARDVARK_BIN="${PREFIX}/bin/aardvark-dns"
 EPAIR_NV_BIN="${PREFIX}/libexec/netavark/epair"
 FLUA_BIN="/usr/libexec/flua"
 DEFAULT_DNS_BIND_PORT="5300"
+PODMAN_CONF_OVERRIDE=""
 
 usage() {
 	cat <<'EOF'
@@ -39,12 +42,67 @@ require_root() {
 	fi
 }
 
+pman() {
+	if [ -n "$PODMAN_CONF_OVERRIDE" ]; then
+		CONTAINERS_CONF_OVERRIDE="$PODMAN_CONF_OVERRIDE" podman "$@"
+	else
+		podman "$@"
+	fi
+}
+
+podman_version() {
+	podman --version 2>/dev/null | awk '{print $3}'
+}
+
+podman_major() {
+	_pv=$(podman_version)
+	_pm=${_pv%%.*}
+	case "$_pm" in
+		''|*[!0-9]*) printf '0\n' ;;
+		*) printf '%s\n' "$_pm" ;;
+	esac
+}
+
 backend_of() {
-	podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || printf 'unknown'
+	pman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || printf 'unknown'
+}
+
+stale_cni_conf_files() {
+	for _cf in "$CONTAINERS_CONF_DIR/containers.conf" "$CONTAINERS_CONF_DIR"/containers.conf.d/*.conf; do
+		[ -f "$_cf" ] || continue
+		[ "$_cf" = "$CONF_DROPIN" ] && continue
+		if grep -Eq '^[[:space:]]*network_backend[[:space:]]*=[[:space:]]*"cni"' "$_cf"; then
+			printf '%s\n' "$_cf"
+		fi
+	done
+}
+
+nv_networks_csv() {
+	[ -d "$NV_NET_DIR" ] || return 0
+	for _jf in "$NV_NET_DIR"/*.json; do
+		[ -f "$_jf" ] || continue
+		_jn=${_jf##*/}
+		printf '%s,' "${_jn%.json}"
+	done
+}
+
+leftover_cni_ifaces() {
+	{
+		ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^cni-podman' || true
+		ifconfig -g epair 2>/dev/null | grep -E '^(vnet|eth[0-9])' || true
+	} | sed '/^$/d' | sort -u
 }
 
 host_ifaces_csv() {
 	ifconfig -l 2>/dev/null | tr ' ' ','
+}
+
+vlanfilter_bridges_csv() {
+	for _b in $(ifconfig -g bridge 2>/dev/null || true); do
+		if ifconfig "$_b" 2>/dev/null | grep -q 'bridge flags=.*VLANFILTER'; then
+			printf '%s,' "$_b"
+		fi
+	done
 }
 
 host_53_listener() {
@@ -244,12 +302,50 @@ local function read_file(path)
 	return s
 end
 
+local function append_ipam_flags(cmd, ipam)
+	local has_v6 = false
+	local ip_flags = {}
+	local ranges = (ipam and ipam.ranges) or {}
+	for _, grp in ipairs(ranges) do
+		if type(grp) == "table" then
+			for _, r in ipairs(grp) do
+				if type(r) == "table" and r.subnet then
+					local sub = tostring(r.subnet)
+					if sub:find(":", 1, true) then has_v6 = true end
+					ip_flags[#ip_flags + 1] = "--subnet"
+					ip_flags[#ip_flags + 1] = sub
+					if r.gateway and r.gateway ~= "" then
+						ip_flags[#ip_flags + 1] = "--gateway"
+						ip_flags[#ip_flags + 1] = tostring(r.gateway)
+					end
+					if r.rangeStart and r.rangeEnd and r.rangeStart ~= "" and r.rangeEnd ~= "" then
+						ip_flags[#ip_flags + 1] = "--ip-range"
+						ip_flags[#ip_flags + 1] = tostring(r.rangeStart) .. "-" .. tostring(r.rangeEnd)
+					end
+				end
+			end
+		end
+	end
+	if has_v6 then cmd[#cmd + 1] = "--ipv6" end
+	for _, f in ipairs(ip_flags) do cmd[#cmd + 1] = f end
+end
+
 local function exec_conflists()
 	local epair_nv = arg[2]
 	local ifaces_csv = arg[3] or ""
+	local vlan_csv = arg[4] or ""
+	local nv_csv = arg[5] or ""
 	local ifaces = {}
 	for tok in ifaces_csv:gmatch("[^,]+") do
 		ifaces[tok] = true
+	end
+	local vlan_ifaces = {}
+	for tok in vlan_csv:gmatch("[^,]+") do
+		vlan_ifaces[tok] = true
+	end
+	local nv_nets = {}
+	for tok in nv_csv:gmatch("[^,]+") do
+		nv_nets[tok] = true
 	end
 	local has_epair_nv = false
 	local ef = io.open(epair_nv, "r")
@@ -258,7 +354,7 @@ local function exec_conflists()
 		has_epair_nv = (os.execute("test -x " .. sh_quote(epair_nv)) == true)
 	end
 
-	for i = 4, #arg do
+	for i = 6, #arg do
 		local path = arg[i]
 		local text, rerr = read_file(path)
 		if not text then
@@ -275,6 +371,7 @@ local function exec_conflists()
 					print("BLOCKER\t" .. path .. " missing name or plugins[1]")
 				else
 					local ptype = tostring(main.type or "")
+					print("CNINET\t" .. name)
 					local has_dnsname = false
 					for _, p in ipairs(plugins) do
 						if type(p) == "table" and p.type == "dnsname" then
@@ -282,7 +379,12 @@ local function exec_conflists()
 						end
 					end
 
-					if ptype == "bridge" then
+					if name ~= "podman" and nv_nets[name] then
+						if ptype == "bridge" and main.bridge and tostring(main.bridge) ~= "" then
+							print("CNIBRIDGE\t" .. tostring(main.bridge))
+						end
+						print("INFO\t" .. name .. " -> already exists in netavark; will archive CNI conflist")
+					elseif ptype == "bridge" then
 						local br = tostring(main.bridge or "")
 						if br ~= "" then
 							print("CNIBRIDGE\t" .. br)
@@ -311,30 +413,7 @@ local function exec_conflists()
 								cmd[#cmd + 1] = "-o"
 								cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
 							end
-							local has_v6 = false
-							local ip_flags = {}
-							for _, grp in ipairs(ranges) do
-								if type(grp) == "table" then
-									for _, r in ipairs(grp) do
-										if type(r) == "table" and r.subnet then
-											local sub = tostring(r.subnet)
-											if sub:find(":", 1, true) then has_v6 = true end
-											ip_flags[#ip_flags + 1] = "--subnet"
-											ip_flags[#ip_flags + 1] = sub
-											if r.gateway and r.gateway ~= "" then
-												ip_flags[#ip_flags + 1] = "--gateway"
-												ip_flags[#ip_flags + 1] = tostring(r.gateway)
-											end
-											if r.rangeStart and r.rangeEnd and r.rangeStart ~= "" and r.rangeEnd ~= "" then
-												ip_flags[#ip_flags + 1] = "--ip-range"
-												ip_flags[#ip_flags + 1] = tostring(r.rangeStart) .. "-" .. tostring(r.rangeEnd)
-											end
-										end
-									end
-								end
-							end
-							if has_v6 then cmd[#cmd + 1] = "--ipv6" end
-							for _, f in ipairs(ip_flags) do cmd[#cmd + 1] = f end
+							append_ipam_flags(cmd, ipam)
 							cmd[#cmd + 1] = name
 							local q = {}
 							for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
@@ -347,18 +426,43 @@ local function exec_conflists()
 						local master = tostring(main.master or main.bridge or "")
 						local ipam = main.ipam or {}
 						local itype = tostring(ipam.type or "host-local")
+						local has_vlan = (main.vlan ~= nil and tostring(main.vlan) ~= "")
+							or (main.taggedVlans ~= nil and tostring(main.taggedVlans) ~= "")
 						if master == "" then
 							print("BLOCKER\t" .. name .. " (epair) has no master bridge configured")
 						elseif not ifaces[master] then
 							print("BLOCKER\t" .. name .. " (epair) host bridge '" .. master .. "' does not exist")
+						elseif has_vlan and type(main.taggedVlans) == "table" then
+							print("BLOCKER\t" .. name .. " (epair VLAN) taggedVlans must be a string such as \"3,4\", not an array")
+						elseif (itype == "dhcp" or (itype == "host-local" and has_vlan)) and not has_epair_nv then
+							print("BLOCKER\t" .. name .. " (epair " .. itype .. ") requires " .. epair_nv .. " (cni-epair with netavark mode)")
+						elseif has_vlan and not vlan_ifaces[master] then
+							print("BLOCKER\t" .. name .. " (epair VLAN) host bridge '" .. master .. "' does not have vlanfilter enabled; run: ifconfig " .. master .. " vlanfilter")
 						elseif itype == "dhcp" then
-							if not has_epair_nv then
-								print("BLOCKER\t" .. name .. " (epair DHCP) requires " .. epair_nv .. " (cni-epair with netavark mode)")
-							else
+							local cmd = {
+								"podman", "network", "create", "--disable-dns",
+								"-d", "epair", "--ipam-driver", "none",
+								"--interface-name", master
+							}
+							if main.mtu then
+								cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
+							end
+							if main.vlan then
+								cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "vlan=" .. tostring(main.vlan)
+							end
+							if main.taggedVlans then
+								cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "taggedVlans=" .. tostring(main.taggedVlans)
+							end
+							cmd[#cmd + 1] = name
+							local q = {}
+							for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
+							print("CREATE\t" .. name .. "\tepair-dhcp\t" .. table.concat(q, " "))
+							print("INFO\t" .. name .. " (CNI epair DHCP -> netavark epair plugin): " .. table.concat(cmd, " "))
+						elseif itype == "host-local" then
+							if has_vlan then
 								local cmd = {
 									"podman", "network", "create", "--disable-dns",
-									"-d", "epair", "--ipam-driver", "none",
-									"-o", "master=" .. master
+									"-d", "epair", "--interface-name", master
 								}
 								if main.mtu then
 									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
@@ -369,15 +473,12 @@ local function exec_conflists()
 								if main.taggedVlans then
 									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "taggedVlans=" .. tostring(main.taggedVlans)
 								end
+								append_ipam_flags(cmd, ipam)
 								cmd[#cmd + 1] = name
 								local q = {}
 								for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
-								print("CREATE\t" .. name .. "\tepair-dhcp\t" .. table.concat(q, " "))
-								print("INFO\t" .. name .. " (CNI epair DHCP -> netavark epair plugin): " .. table.concat(cmd, " "))
-							end
-						elseif itype == "host-local" then
-							if main.vlan or main.taggedVlans then
-								print("BLOCKER\t" .. name .. " (epair host-local with vlan/taggedVlans) has no netavark VLAN bridge mapping yet")
+								print("CREATE\t" .. name .. "\tepair-vlan\t" .. table.concat(q, " "))
+								print("INFO\t" .. name .. " (CNI epair host-local VLAN -> netavark epair plugin on " .. master .. "): " .. table.concat(cmd, " "))
 							else
 								local cmd = {
 									"podman", "network", "create", "--disable-dns",
@@ -387,31 +488,7 @@ local function exec_conflists()
 								if main.mtu then
 									cmd[#cmd + 1] = "-o"; cmd[#cmd + 1] = "mtu=" .. tostring(main.mtu)
 								end
-								local has_v6 = false
-								local ip_flags = {}
-								local ranges = ipam.ranges or {}
-								for _, grp in ipairs(ranges) do
-									if type(grp) == "table" then
-										for _, r in ipairs(grp) do
-											if type(r) == "table" and r.subnet then
-												local sub = tostring(r.subnet)
-												if sub:find(":", 1, true) then has_v6 = true end
-												ip_flags[#ip_flags + 1] = "--subnet"
-												ip_flags[#ip_flags + 1] = sub
-												if r.gateway and r.gateway ~= "" then
-													ip_flags[#ip_flags + 1] = "--gateway"
-													ip_flags[#ip_flags + 1] = tostring(r.gateway)
-												end
-												if r.rangeStart and r.rangeEnd and r.rangeStart ~= "" and r.rangeEnd ~= "" then
-													ip_flags[#ip_flags + 1] = "--ip-range"
-													ip_flags[#ip_flags + 1] = tostring(r.rangeStart) .. "-" .. tostring(r.rangeEnd)
-												end
-											end
-										end
-									end
-								end
-								if has_v6 then cmd[#cmd + 1] = "--ipv6" end
-								for _, f in ipairs(ip_flags) do cmd[#cmd + 1] = f end
+								append_ipam_flags(cmd, ipam)
 								cmd[#cmd + 1] = name
 								local q = {}
 								for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
@@ -461,10 +538,36 @@ local function extract_pins(create_cmd)
 	return pins
 end
 
+local function csv_set(csv)
+	local s = {}
+	for tok in (csv or ""):gmatch("[^,]+") do
+		s[tok] = true
+	end
+	return s
+end
+
 local function exec_containers()
 	local inspect_path = arg[2]
 	local running_path = arg[3] or ""
 	local recreate_path = arg[4] or ""
+	local pmajor = tonumber(arg[5]) or 0
+	local cni_nets = csv_set(arg[6])
+	local nv_nets = csv_set(arg[7])
+	local stop_now_path = arg[8] or ""
+	local ps_nets_path = arg[9] or ""
+	local host_net_work = (tonumber(arg[10]) or 1) ~= 0
+	local ps_nets_by_name = {}
+	if ps_nets_path ~= "" then
+		local pt = read_file(ps_nets_path)
+		if pt then
+			for pline in pt:gmatch("[^\r\n]+") do
+				local pname, pnets = pline:match("^([^\t]+)\t(.*)$")
+				if pname and pnets and trim(pnets) ~= "" then
+					ps_nets_by_name[pname] = pnets
+				end
+			end
+		end
+	end
 	local text, rerr = read_file(inspect_path)
 	if not text or trim(text) == "" then
 		return
@@ -472,15 +575,22 @@ local function exec_containers()
 	local arr = json_decode(text)
 	if type(arr) ~= "table" then error("inspect output is not an array") end
 
+	local stop_now_lines = {}
 	local run_lines = {}
 	local rec_lines = { "#!/bin/sh", "# Captured pre-migration container run commands (fallback only)" }
+	local p6_work = 0
 
 	for _, c in ipairs(arr) do
 		local name = tostring(c.Name or "")
-		local state = (c.State and c.State.Running) and "running" or "stopped"
+		local is_running = (c.State and c.State.Running == true)
+		local err_str = tostring((c.State and c.State.Error) or "")
+		local stopped_by_user = (c.State and c.State.StoppedByUser == true)
+		local rp = tostring((c.HostConfig and c.HostConfig.RestartPolicy and c.HostConfig.RestartPolicy.Name) or "")
 		local net_map = (c.NetworkSettings and c.NetworkSettings.Networks) or {}
 		local nets = {}
 		local live = {}
+		local uses_custom_cni = false
+		local missing_net = nil
 		for k, v in pairs(net_map) do
 			nets[#nets + 1] = k
 			if type(v) == "table" then
@@ -489,6 +599,23 @@ local function exec_containers()
 				if v.MacAddress and v.MacAddress ~= "" then parts[#parts + 1] = v.MacAddress end
 				if #parts > 0 then
 					live[#live + 1] = k .. ":" .. table.concat(parts, "/")
+				end
+			end
+		end
+		if #nets == 0 and ps_nets_by_name[name] then
+			for tok in ps_nets_by_name[name]:gmatch("[^,]+") do
+				tok = trim(tok)
+				if tok ~= "" then
+					nets[#nets + 1] = tok
+				end
+			end
+		end
+		for _, k in ipairs(nets) do
+			if k ~= "podman" and k ~= "bridge" and k ~= "default" then
+				if cni_nets[k] and not nv_nets[k] then
+					uses_custom_cni = true
+				elseif not nv_nets[k] and not cni_nets[k] then
+					missing_net = k
 				end
 			end
 		end
@@ -501,15 +628,47 @@ local function exec_containers()
 		if #live > 0 then note_parts[#note_parts + 1] = "live(" .. table.concat(live, ";") .. ")" end
 		local note = #note_parts > 0 and table.concat(note_parts, " ") or "pool"
 
-		local action = (state == "running")
-			and "stop on CNI -> carry over in place -> start on netavark"
-			or "keep stopped in place"
-		print(string.format("CTR\t%s\t%s\t%s\t%s\t%s",
-			name, state, #nets > 0 and table.concat(nets, ",") or "none", note, action))
-
-		if state == "running" then
-			run_lines[#run_lines + 1] = name
+		local state_label = is_running and "running" or "stopped"
+		local action = "keep stopped in place"
+		if pmajor < 6 then
+			if is_running then
+				action = "stop on CNI -> carry over in place -> start on netavark"
+				stop_now_lines[#stop_now_lines + 1] = name
+				run_lines[#run_lines + 1] = name
+			end
+		else
+			if is_running then
+				stop_now_lines[#stop_now_lines + 1] = name
+				run_lines[#run_lines + 1] = name
+				if uses_custom_cni or cni_nets["podman"] then
+					action = "stop pre-upgrade CNI jail -> remake network -> start on netavark"
+					p6_work = p6_work + 1
+				elseif host_net_work then
+					action = "restart on netavark after host/pf setup"
+				else
+					action = "keep running (already on netavark)"
+				end
+			elseif err_str:find("network not found", 1, true) ~= nil then
+				state_label = "stopped (error: network not found)"
+				if missing_net == nil then
+					action = "remake network -> start on netavark"
+					run_lines[#run_lines + 1] = name
+					p6_work = p6_work + 1
+				else
+					action = "keep stopped (missing CNI conflist for '" .. missing_net .. "')"
+					print("WARN\tcontainer " .. name .. " failed with 'network not found' for '" .. missing_net .. "', which has no CNI conflist")
+				end
+			elseif (not stopped_by_user) and (rp == "always" or rp == "unless-stopped") and uses_custom_cni then
+				state_label = "stopped (restart=" .. rp .. ")"
+				action = "remake network -> start on netavark"
+				run_lines[#run_lines + 1] = name
+				p6_work = p6_work + 1
+			end
 		end
+
+		print(string.format("CTR\t%s\t%s\t%s\t%s\t%s",
+			name, state_label, #nets > 0 and table.concat(nets, ",") or "none", note, action))
+
 		local cc = c.Config and c.Config.CreateCommand
 		if type(cc) == "table" and #cc > 0 then
 			local q = {}
@@ -519,6 +678,13 @@ local function exec_containers()
 		end
 	end
 
+	print("P6_WORK\t" .. tostring(p6_work))
+
+	if stop_now_path ~= "" then
+		local sf = assert(io.open(stop_now_path, "w"))
+		if #stop_now_lines > 0 then sf:write(table.concat(stop_now_lines, "\n") .. "\n") end
+		sf:close()
+	end
 	if running_path ~= "" then
 		local rf = assert(io.open(running_path, "w"))
 		if #run_lines > 0 then rf:write(table.concat(run_lines, "\n") .. "\n") end
@@ -672,24 +838,54 @@ run_preflight() {
 	PLAN_RUN_FILE="$3"
 	PLAN_RECREATE_FILE="$4"
 	PLAN_INSPECT_FILE="$5"
+	PLAN_STOP_NOW_FILE="$6"
+	WORK_DIR=$(dirname "$PLAN_CREATE_FILE")
 
 	: > "$PLAN_CREATE_FILE"
 	: > "$PLAN_BRIDGES_FILE"
 	: > "$PLAN_RUN_FILE"
+	: > "$PLAN_STOP_NOW_FILE"
+	PODMAN_CONF_OVERRIDE=""
 
 	say "== Host checks =="
+	PVER=$(podman_version)
+	PMAJOR=$(podman_major)
+	say "  podman: ${PVER:-unknown}"
+	STALE_CNI_CONFS=$(stale_cni_conf_files)
 	BACKEND=$(backend_of)
-	say "  backend: $BACKEND"
-	if [ "$BACKEND" = "netavark" ]; then
-		say "  already running on netavark"
-		if [ -d "$STATE_DIR" ]; then
-			say "  rollback state present in $STATE_DIR (run 'netavark-migrate back' to return to CNI)"
-		fi
-		return 2
+	if [ "$PMAJOR" -ge 6 ] && { [ -n "$STALE_CNI_CONFS" ] || [ "$BACKEND" = "unknown" ]; }; then
+		OVERRIDE_CONF="$WORK_DIR/override-netavark.conf"
+		cat > "$OVERRIDE_CONF" <<'EOF'
+[network]
+network_backend = "netavark"
+EOF
+		PODMAN_CONF_OVERRIDE="$OVERRIDE_CONF"
+		BACKEND=$(backend_of)
 	fi
-	if [ "$BACKEND" != "cni" ]; then
-		err "unexpected Podman network backend '$BACKEND'"
-		BLOCKERS=$((BLOCKERS + 1))
+	say "  backend: $BACKEND"
+	if [ "$PMAJOR" -lt 6 ]; then
+		if [ "$BACKEND" = "netavark" ]; then
+			say "  already running on netavark"
+			if [ -d "$STATE_DIR" ]; then
+				say "  rollback state present in $STATE_DIR (run 'netavark-migrate back' to return to CNI)"
+			fi
+			return 2
+		fi
+		if [ "$BACKEND" != "cni" ]; then
+			err "unexpected Podman network backend '$BACKEND'"
+			BLOCKERS=$((BLOCKERS + 1))
+		fi
+	else
+		say "  mode: Podman 6 post-upgrade recovery (CNI backend removed in Podman 6)"
+		if [ "$BACKEND" != "netavark" ]; then
+			err "unexpected Podman network backend '$BACKEND'"
+			BLOCKERS=$((BLOCKERS + 1))
+		fi
+		if [ -n "$STALE_CNI_CONFS" ]; then
+			for _scf in $STALE_CNI_CONFS; do
+				say "  stale config: $_scf sets network_backend = \"cni\" -> will comment out"
+			done
+		fi
 	fi
 
 	if [ -x "$NETAVARK_BIN" ]; then
@@ -720,6 +916,7 @@ run_preflight() {
 		say "  vfs.inotify.max_user_instances: $INOTIFY (ok)"
 	fi
 
+	PF_STATUS=""
 	if [ ! -f "$PF_CONF" ]; then
 		err "blocker: $PF_CONF not found"
 		BLOCKERS=$((BLOCKERS + 1))
@@ -753,8 +950,14 @@ run_preflight() {
 	fi
 
 	DNS53=$(host_53_listener)
+	DNS_NEEDS_CFG=0
 	if [ -n "$DNS53" ]; then
-		say "  *:53 listener: $DNS53-> will set dns_bind_port = $DEFAULT_DNS_BIND_PORT in $CONF_DROPIN"
+		if grep -Eq '^[[:space:]]*dns_bind_port[[:space:]]*=' "$CONTAINERS_CONF_DIR/containers.conf" "$CONTAINERS_CONF_DIR"/containers.conf.d/*.conf 2>/dev/null; then
+			say "  *:53 listener: $DNS53(dns_bind_port already configured)"
+		else
+			DNS_NEEDS_CFG=1
+			say "  *:53 listener: $DNS53-> will set dns_bind_port = $DEFAULT_DNS_BIND_PORT in $CONF_DROPIN"
+		fi
 	else
 		say "  *:53 listener: none (aardvark-dns will bind <gateway>:53)"
 	fi
@@ -764,15 +967,23 @@ run_preflight() {
 		WARNINGS=$((WARNINGS + 1))
 	fi
 
+	LEFTOVER_IFACES=$(leftover_cni_ifaces)
+	if [ -n "$LEFTOVER_IFACES" ] && [ "$PMAJOR" -ge 6 ]; then
+		say "  leftover CNI interfaces: $(printf '%s' "$LEFTOVER_IFACES" | tr '\n' ' ') (will destroy)"
+	fi
+
 	say ""
 	say "== Networks ($CNI_DIR) =="
 	collect_conflist_files
+	NV_NETS_CSV=$(nv_networks_csv)
+	CNI_NETS_CSV=""
 	if [ -z "$CONFLIST_ARGS" ]; then
 		say "  none (built-in default podman network only)"
 	else
 		IFACES=$(host_ifaces_csv)
+		VLAN_BRIDGES=$(vlanfilter_bridges_csv)
 		# shellcheck disable=SC2086
-		NET_PLAN=$(run_lua conflists "$EPAIR_NV_BIN" "$IFACES" $CONFLIST_ARGS)
+		NET_PLAN=$(run_lua conflists "$EPAIR_NV_BIN" "$IFACES" "$VLAN_BRIDGES" "$NV_NETS_CSV" $CONFLIST_ARGS)
 		OLDIFS=$IFS
 		IFS='
 '
@@ -782,6 +993,9 @@ run_preflight() {
 			case "$tag" in
 				INFO)
 					say "  $rest"
+					;;
+				CNINET)
+					CNI_NETS_CSV="${CNI_NETS_CSV}${rest},"
 					;;
 				CREATE)
 					printf '%s\n' "$rest" >> "$PLAN_CREATE_FILE"
@@ -798,32 +1012,68 @@ run_preflight() {
 		IFS=$OLDIFS
 	fi
 
+	HOST_NET_WORK=0
+	[ -n "$CONFLIST_ARGS" ] && HOST_NET_WORK=1
+	[ -n "$STALE_CNI_CONFS" ] && HOST_NET_WORK=1
+	[ -n "$LEFTOVER_IFACES" ] && HOST_NET_WORK=1
+	if pgrep -f '/cni/dnsname/' >/dev/null 2>&1; then
+		HOST_NET_WORK=1
+	fi
+	case "$PF_STATUS" in
+		MISSING*) HOST_NET_WORK=1 ;;
+	esac
+	[ "$FILTER_LOCAL" != "1" ] && HOST_NET_WORK=1
+	[ "$IP_FWD" != "1" ] && HOST_NET_WORK=1
+	[ "$DNS_NEEDS_CFG" -eq 1 ] && HOST_NET_WORK=1
+
 	say ""
 	say "== Containers =="
-	CIDS=$(podman ps -aq 2>/dev/null || true)
+	P6_CTR_WORK=0
+	CIDS=$(pman ps -aq 2>/dev/null || true)
 	if [ -z "$CIDS" ]; then
 		say "  none"
 		: > "$PLAN_INSPECT_FILE"
 	else
+		PLAN_PSNETS_FILE="$WORK_DIR/psnets"
+		pman ps -a --format '{{.Names}}	{{.Networks}}' > "$PLAN_PSNETS_FILE" 2>/dev/null || : > "$PLAN_PSNETS_FILE"
 		# shellcheck disable=SC2086
-		podman container inspect $CIDS > "$PLAN_INSPECT_FILE"
-		CTR_PLAN=$(run_lua containers "$PLAN_INSPECT_FILE" "$PLAN_RUN_FILE" "$PLAN_RECREATE_FILE")
+		pman container inspect $CIDS > "$PLAN_INSPECT_FILE"
+		CTR_PLAN=$(run_lua containers "$PLAN_INSPECT_FILE" "$PLAN_RUN_FILE" "$PLAN_RECREATE_FILE" "$PMAJOR" "$CNI_NETS_CSV" "$NV_NETS_CSV" "$PLAN_STOP_NOW_FILE" "$PLAN_PSNETS_FILE" "$HOST_NET_WORK")
 		OLDIFS=$IFS
 		IFS='
 '
 		for line in $CTR_PLAN; do
 			tag=${line%%	*}
 			rest=${line#*	}
-			if [ "$tag" = "CTR" ]; then
-				name=$(printf '%s' "$rest" | cut -f1)
-				state=$(printf '%s' "$rest" | cut -f2)
-				nets=$(printf '%s' "$rest" | cut -f3)
-				note=$(printf '%s' "$rest" | cut -f4)
-				action=$(printf '%s' "$rest" | cut -f5)
-				say "  $name ($state): nets=[$nets] $note -> $action"
-			fi
+			case "$tag" in
+				CTR)
+					name=$(printf '%s' "$rest" | cut -f1)
+					state=$(printf '%s' "$rest" | cut -f2)
+					nets=$(printf '%s' "$rest" | cut -f3)
+					note=$(printf '%s' "$rest" | cut -f4)
+					action=$(printf '%s' "$rest" | cut -f5)
+					say "  $name ($state): nets=[$nets] $note -> $action"
+					;;
+				P6_WORK)
+					P6_CTR_WORK="$rest"
+					;;
+				WARN)
+					warn "$rest"
+					WARNINGS=$((WARNINGS + 1))
+					;;
+			esac
 		done
 		IFS=$OLDIFS
+	fi
+
+	if [ "$PMAJOR" -ge 6 ] && [ "$BLOCKERS" -eq 0 ]; then
+		NEEDS_P6_MIGRATE="$HOST_NET_WORK"
+		[ "$P6_CTR_WORK" -gt 0 ] && NEEDS_P6_MIGRATE=1
+		if [ "$NEEDS_P6_MIGRATE" -eq 0 ]; then
+			say ""
+			say "  already running on netavark; no unmigrated CNI networks or failed containers"
+			return 2
+		fi
 	fi
 
 	say ""
@@ -839,7 +1089,7 @@ cmd_check() {
 	TMPD=$(mktemp -d /tmp/netavark-migrate-check.XXXXXX)
 	trap 'rm -rf "$TMPD"' EXIT
 	set +e
-	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect"
+	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect" "$TMPD/stop_now"
 	rc=$?
 	set -e
 	if [ "$rc" -eq 2 ]; then
@@ -854,7 +1104,7 @@ cmd_switch() {
 	trap 'rm -rf "$TMPD"' EXIT
 
 	set +e
-	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect"
+	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect" "$TMPD/stop_now"
 	rc=$?
 	set -e
 	if [ "$rc" -eq 2 ]; then
@@ -870,7 +1120,6 @@ cmd_switch() {
 
 	mkdir -p "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
-	rm -rf "$STATE_DIR/cni-net.d"
 	mkdir -p "$STATE_DIR/cni-net.d"
 	cp "$TMPD/running" "$STATE_DIR/running-containers.txt"
 	cp "$TMPD/inspect" "$STATE_DIR/containers-inspect.json"
@@ -878,22 +1127,56 @@ cmd_switch() {
 		cp "$TMPD/recreate" "$STATE_DIR/recreate-commands.sh"
 		chmod 700 "$STATE_DIR/recreate-commands.sh"
 	fi
-	cp "$PF_CONF" "$STATE_DIR/pf.conf.pre-netavark"
-
-	# 1. Stop running containers while still on CNI so CNI tears down leases/epairs cleanly.
-	if [ -s "$STATE_DIR/running-containers.txt" ]; then
-		RUN_LIST=$(tr '\n' ' ' < "$STATE_DIR/running-containers.txt")
-		say "  stopping running containers on CNI: $RUN_LIST"
-		# shellcheck disable=SC2086
-		podman stop -t 10 $RUN_LIST >/dev/null
+	if [ ! -f "$STATE_DIR/pf.conf.pre-netavark" ]; then
+		cp "$PF_CONF" "$STATE_DIR/pf.conf.pre-netavark"
 	fi
 
-	# 2. Stop leftover CNI dnsname dnsmasq and destroy CNI bridges (cni-podman* and conflist bridge names).
+	# 1. Stop running containers (under CNI on Podman 5, or pre-upgrade CNI / pre-PF jails on Podman 6).
+	if [ -s "$TMPD/stop_now" ]; then
+		STOP_LIST=$(tr '\n' ' ' < "$TMPD/stop_now")
+		if [ "$PMAJOR" -lt 6 ]; then
+			say "  stopping running containers on CNI: $STOP_LIST"
+			# shellcheck disable=SC2086
+			pman stop -t 10 $STOP_LIST >/dev/null
+		else
+			say "  stopping currently running containers: $STOP_LIST"
+			for _sc in $(cat "$TMPD/stop_now"); do
+				pman stop -t 10 "$_sc" >/dev/null 2>&1 || true
+				# Fallback if pre-upgrade CNI network teardown failed after stopping or before stopping jail
+				if [ "$(pman inspect --format '{{.State.Running}}' "$_sc" 2>/dev/null || printf false)" = "true" ]; then
+					_cid=$(pman inspect --format '{{.Id}}' "$_sc" 2>/dev/null || printf '')
+					if [ -n "$_cid" ]; then
+						pkill -f "$_cid" 2>/dev/null || true
+						jail -r "$_cid" 2>/dev/null || true
+					fi
+				fi
+			done
+		fi
+	fi
+
+	# 2. Stop leftover CNI dnsname dnsmasq, CNI epair interfaces, and CNI bridges.
 	pkill -f '/cni/dnsname/' 2>/dev/null || true
-	ALL_CNI_BRIDGES=$( { ifconfig -l | tr ' ' '\n' | grep '^cni-podman' || true; cat "$TMPD/bridges"; } | sort -u )
+	if [ -d "$CNI_EPAIR_STATE_DIR" ]; then
+		for _ef in "$CNI_EPAIR_STATE_DIR"/*; do
+			[ -f "$_ef" ] || continue
+			_ep=$(cat "$_ef" 2>/dev/null || true)
+			if [ -n "$_ep" ] && ifconfig "$_ep" >/dev/null 2>&1; then
+				say "  destroying CNI epair $_ep"
+				ifconfig "$_ep" destroy 2>/dev/null || true
+			fi
+			rm -f "$_ef"
+		done
+	fi
+	for _ep in $(ifconfig -g epair 2>/dev/null | grep -E '^(vnet|eth[0-9])' || true); do
+		if ifconfig "$_ep" >/dev/null 2>&1; then
+			say "  destroying leftover CNI epair $_ep"
+			ifconfig "$_ep" destroy 2>/dev/null || true
+		fi
+	done
+	ALL_CNI_BRIDGES=$( { ifconfig -l | tr ' ' '\n' | grep '^cni-podman' || true; cat "$TMPD/bridges"; if [ "$PMAJOR" -ge 6 ]; then ifconfig -l | tr ' ' '\n' | grep '^podman[0-9]' || true; fi; } | sort -u )
 	for br in $ALL_CNI_BRIDGES; do
 		if ifconfig "$br" >/dev/null 2>&1; then
-			say "  destroying CNI bridge $br"
+			say "  destroying CNI/stale bridge $br"
 			ifconfig "$br" destroy
 		fi
 	done
@@ -907,7 +1190,16 @@ cmd_switch() {
 		done
 	fi
 
-	# 4. Write containers.conf drop-in and confirm netavark backend.
+	# 4. Clear stale network_backend="cni" configs (on Podman 6), write drop-in, and confirm netavark backend.
+	if [ -n "$STALE_CNI_CONFS" ]; then
+		mkdir -p "$STATE_DIR/containers-conf.bak"
+		for _scf in $STALE_CNI_CONFS; do
+			cp "$_scf" "$STATE_DIR/containers-conf.bak/$(basename "$_scf")"
+			sed -i '' -E 's/^([[:space:]]*network_backend[[:space:]]*=[[:space:]]*"cni".*)$/# \1 # disabled by netavark-migrate/' "$_scf"
+			say "  commented out network_backend=\"cni\" in $_scf"
+		done
+		PODMAN_CONF_OVERRIDE=""
+	fi
 	mkdir -p "$(dirname "$CONF_DROPIN")"
 	DNS53=$(host_53_listener)
 	if [ -n "$DNS53" ]; then
@@ -1014,7 +1306,11 @@ EOF
 			say "  container $cname: running=$st ips=[${ips% }]"
 		done
 	fi
-	say "  rollback saved under $STATE_DIR (use 'netavark-migrate back' to revert to CNI)"
+	if [ "$PMAJOR" -ge 6 ]; then
+		say "  archived CNI conflists under $STATE_DIR (Podman 6 removed CNI; rollback requires Podman 5)"
+	else
+		say "  rollback saved under $STATE_DIR (use 'netavark-migrate back' to revert to CNI)"
+	fi
 
 	if [ "$FAILURES" -gt 0 ]; then
 		err "completed with $FAILURES failure(s)"
@@ -1025,6 +1321,10 @@ EOF
 
 cmd_back() {
 	require_root
+	if [ "$(podman_major)" -ge 6 ]; then
+		err "Podman $(podman_version) does not support the CNI backend; downgrade to Podman 5 before running 'netavark-migrate back'"
+		exit 1
+	fi
 	if [ ! -d "$STATE_DIR" ]; then
 		err "no migration state found in $STATE_DIR"
 		exit 1

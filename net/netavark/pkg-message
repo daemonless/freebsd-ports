@@ -2,14 +2,15 @@
 { type: install
   message: <<EOM
 Installing netavark does not change your active Podman setup: CNI remains
-the default in Podman 5 and continues to work as before (Podman 6 uses
-netavark by default).
+the default in Podman 5 and continues to work as before. Podman 6 removes
+the CNI backend (rejecting network_backend = "cni") and uses netavark
+exclusively.
 
 netavark is opt-in on Podman 5. Opting in gives containers name
 resolution via aardvark-dns, isolated custom networks, and automatic pf
-anchors. Existing CNI custom networks must be recreated before starting
-containers under netavark. To check readiness or migrate an existing CNI
-host, run:
+anchors, and prepares existing images, containers, and custom CNI
+networks to open and run directly under Podman 6. To check readiness
+or migrate an existing CNI host, run:
 
   # /usr/local/sbin/netavark-migrate check
   # /usr/local/sbin/netavark-migrate
