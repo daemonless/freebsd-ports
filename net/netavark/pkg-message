@@ -25,14 +25,14 @@ To switch back to CNI, run `/usr/local/sbin/netavark-migrate back` (or
 remove that file and restore your CNI conflists and containers).
 
 netavark keeps its pf rules in anchors under "netavark/". pf must be
-enabled, and /etc/pf.conf must declare the tables and include the
-anchors:
+enabled, and /etc/pf.conf must include the anchors:
 
-  table <netavark-subnets> persist
-  table <netavark-isolated> persist
   nat-anchor "netavark/*"
   rdr-anchor "netavark/*"
   anchor "netavark/*"
+
+Existing table <netavark-subnets> and table <netavark-isolated> lines
+are harmless if still present in /etc/pf.conf, though no longer needed.
 
 To reach published ports through the host's own addresses, including
 127.0.0.1, set this before pf is enabled:
@@ -56,8 +56,10 @@ aardvark-dns and restart containers that use DNS):
 aardvark-dns 2.1.0 needs inotify (vfs.inotify.max_user_instances 0 or
 higher, default 256).
 
-After "service pf restart" or "pfctl -F all", restore the rules of
-running containers with:
+Rules and isolation tables live inside "netavark/*" sub-anchors and
+survive "service pf reload" and "service pf restart". After a bare
+"pfctl -F all", reload /etc/pf.conf; if the sub-anchors themselves are
+flushed, restore the rules of running containers with:
 
   /usr/local/libexec/podman/netavark firewall-reload
 
