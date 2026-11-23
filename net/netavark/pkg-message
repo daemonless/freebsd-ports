@@ -9,10 +9,12 @@ exclusively.
 netavark is opt-in on Podman 5. Opting in gives containers name
 resolution via aardvark-dns, isolated custom networks, and automatic pf
 anchors, and prepares existing images, containers, and custom CNI
-networks to open and run directly under Podman 6. To check readiness
+networks to open and run directly under Podman 6. To check readiness,
+prepare the host side alone (pf anchors, sysctls, loader, dns_bind_port),
 or migrate an existing CNI host, run:
 
   # /usr/local/sbin/netavark-migrate check
+  # /usr/local/sbin/netavark-migrate host
   # /usr/local/sbin/netavark-migrate
 
 Or opt in manually after configuring pf below by creating

@@ -1,16 +1,22 @@
 #!/bin/sh
 # netavark-migrate - Migrate a FreeBSD Podman host between CNI and netavark.
-# Preflight check, in-place migration from CNI to netavark, and rollback.
+# Preflight check, host setup, in-place migration from CNI to netavark, and rollback.
 set -eu
+
+INTERFACE_VERSION="2"
+INTERFACE_CAPS="host json no-start"
 
 PREFIX="@PREFIX@"
 CNI_DIR="${NETAVARK_MIGRATE_CNI_DIR:-${PREFIX}/etc/cni/net.d}"
+BEFORE_CNI_DIR="${NETAVARK_MIGRATE_BEFORE_CNI_DIR:-${CNI_DIR}.before-netavark}"
 NV_NET_DIR="${NETAVARK_MIGRATE_NV_NET_DIR:-${PREFIX}/etc/containers/networks}"
 CONF_DROPIN="${NETAVARK_MIGRATE_DROPIN:-${PREFIX}/etc/containers/containers.conf.d/50-netavark.conf}"
 CONTAINERS_CONF_DIR="${NETAVARK_MIGRATE_CONF_DIR:-${PREFIX}/etc/containers}"
+DNS_CONF_DROPIN="${NETAVARK_MIGRATE_DNS_DROPIN:-${CONTAINERS_CONF_DIR}/containers.conf.d/50-netavark-dns.conf}"
 STATE_DIR="${NETAVARK_MIGRATE_STATE:-/var/db/netavark-migrate}"
 CNI_EPAIR_STATE_DIR="${NETAVARK_MIGRATE_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
 PF_CONF="${NETAVARK_MIGRATE_PF_CONF:-/etc/pf.conf}"
+BEFORE_FJORD_PF="${NETAVARK_MIGRATE_BEFORE_FJORD_PF:-${PF_CONF}.before-fjord}"
 SYSCTL_CONF="${NETAVARK_MIGRATE_SYSCTL_CONF:-/etc/sysctl.conf}"
 LOADER_CONF="${NETAVARK_MIGRATE_LOADER_CONF:-/boot/loader.conf}"
 NETAVARK_BIN="${PREFIX}/libexec/podman/netavark"
@@ -21,14 +27,35 @@ DEFAULT_DNS_BIND_PORT="5300"
 PODMAN_CONF_OVERRIDE=""
 PODMAN_SOCK="${NETAVARK_MIGRATE_SOCK:-}"
 
+JSON_MODE=0
+NO_START=0
+JSON_EMITTED=0
+HOST_MUTATED=0
+JSON_DIR=""
+JSON_STATE=""
+
 usage() {
 	cat <<'EOF'
-Usage: netavark-migrate [check | switch | back]
+Usage: netavark-migrate [check | host | switch | back | version] [--json] [--no-start]
 
 Subcommands:
-  check    Preflight only (changes nothing). Print network and container plan.
-  switch   Migrate CNI -> netavark in place (default when no argument is given).
-  back     Roll back netavark -> CNI using saved state in /var/db/netavark-migrate.
+  check       Preflight only (changes nothing). Print network and container plan.
+  host        Configure the host side only (pf.conf anchors, pf load, sysctl,
+              loader, and dns_bind_port when needed); changes no networks,
+              containers, or backend setting.
+  switch      Migrate CNI -> netavark in place (default when no subcommand is given).
+  back        Roll back netavark -> CNI using saved state and restored conflists.
+  version     Print interface version and capabilities (also --version, -V).
+
+Options:
+  --json      Write one JSON summary document to stdout and human logs to stderr.
+  --no-start  Leave containers stopped during switch or back and list them under
+              containers_need_recreating instead of starting them.
+
+Exit codes:
+  0  Done (or nothing to do).
+  1  Refused before changing anything (preflight failed or invalid arguments).
+  2  Host state was changed, but a step, network, or container failed to come back.
 EOF
 }
 
@@ -36,10 +63,159 @@ say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
+json_init() {
+	JSON_DIR=$(mktemp -d /tmp/netavark-migrate.XXXXXX)
+	JSON_STATE="$JSON_DIR/json"
+	mkdir -p "$JSON_STATE"
+	: > "$JSON_STATE/meta.kv"
+	: > "$JSON_STATE/networks.tsv"
+	: > "$JSON_STATE/kept_nv.txt"
+	: > "$JSON_STATE/started.txt"
+	: > "$JSON_STATE/recreate.txt"
+	: > "$JSON_STATE/failed_ctrs.txt"
+	: > "$JSON_STATE/blockers.txt"
+	: > "$JSON_STATE/warnings.txt"
+	: > "$JSON_STATE/errors.txt"
+
+	json_set_meta version "$INTERFACE_VERSION"
+	json_set_meta action "${ACTION:-check}"
+	json_set_meta ok "false"
+	json_set_meta exit_code "1"
+	json_set_meta changed "false"
+	json_set_meta no_start "$([ "$NO_START" -eq 1 ] && printf true || printf false)"
+	json_set_meta pf_changed "false"
+	json_set_meta pf_status "unchanged"
+	json_set_meta pf_detail ""
+	json_set_meta sysctl_changed "false"
+	json_set_meta sysctl_status "unchanged"
+	json_set_meta sysctl_detail ""
+	json_set_meta loader_changed "false"
+	json_set_meta loader_status "unchanged"
+	json_set_meta loader_detail ""
+	json_set_meta dns_changed "false"
+	json_set_meta dns_status "unchanged"
+	json_set_meta dns_port "53"
+	json_set_meta dns_file ""
+	json_set_meta backend_changed "false"
+	json_set_meta backend_from "unknown"
+	json_set_meta backend_to "unknown"
+	json_set_meta backend_service ""
+	json_refresh_backups
+}
+
+json_clean_str() {
+	printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+json_set_meta() {
+	[ -n "${JSON_STATE:-}" ] || return 0
+	printf '%s\t%s\n' "$1" "$(json_clean_str "${2:-}")" >> "$JSON_STATE/meta.kv"
+}
+
+json_add_net() {
+	[ -n "${JSON_STATE:-}" ] || return 0
+	printf '%s\t%s\t%s\t%s\t%s\n' \
+		"$(json_clean_str "${1:-}")" \
+		"$(json_clean_str "${2:-}")" \
+		"$(json_clean_str "${3:-}")" \
+		"$(json_clean_str "${4:-}")" \
+		"$(json_clean_str "${5:-}")" >> "$JSON_STATE/networks.tsv"
+}
+
+json_add_list() {
+	[ -n "${JSON_STATE:-}" ] || return 0
+	[ -n "${2:-}" ] || return 0
+	printf '%s\n' "$(json_clean_str "$2")" >> "$JSON_STATE/$1.txt"
+}
+
+pf_backup_path() {
+	if [ -f "$BEFORE_FJORD_PF" ]; then
+		printf '%s' "$BEFORE_FJORD_PF"
+	elif [ -f "$STATE_DIR/pf.conf.pre-netavark" ]; then
+		printf '%s' "$STATE_DIR/pf.conf.pre-netavark"
+	fi
+}
+
+json_refresh_backups() {
+	[ -n "${JSON_STATE:-}" ] || return 0
+	json_set_meta backup_state_dir "$([ -d "$STATE_DIR" ] && printf '%s' "$STATE_DIR" || printf '')"
+	json_set_meta backup_pf_conf "$(pf_backup_path)"
+	json_set_meta backup_cni_conflists "$([ -d "$STATE_DIR/cni-net.d" ] && printf '%s' "$STATE_DIR/cni-net.d" || printf '')"
+	json_set_meta backup_before_netavark "$([ -d "$BEFORE_CNI_DIR" ] && printf '%s' "$BEFORE_CNI_DIR" || printf '')"
+	json_set_meta backup_netavark_networks "$([ -d "$STATE_DIR/netavark-networks.bak" ] && printf '%s' "$STATE_DIR/netavark-networks.bak" || printf '')"
+	json_set_meta backup_recreate_commands "$([ -f "$STATE_DIR/recreate-commands.sh" ] && printf '%s' "$STATE_DIR/recreate-commands.sh" || printf '')"
+	_cc_bak=""
+	if [ -d "$STATE_DIR/containers-conf.bak" ]; then
+		_cc_bak="$STATE_DIR/containers-conf.bak"
+	elif [ -d "$STATE_DIR/containers-conf-back.bak" ]; then
+		_cc_bak="$STATE_DIR/containers-conf-back.bak"
+	fi
+	json_set_meta backup_containers_conf "$_cc_bak"
+}
+
+emit_json() {
+	[ "$JSON_MODE" -eq 1 ] || return 0
+	[ "$JSON_EMITTED" -eq 0 ] || return 0
+	JSON_EMITTED=1
+	json_refresh_backups
+	run_lua emit_json "$JSON_STATE" >&3
+}
+
+finish_rc() {
+	_frc="$1"
+	if [ "$_frc" -eq 0 ]; then
+		json_set_meta ok "true"
+	else
+		json_set_meta ok "false"
+	fi
+	json_set_meta exit_code "$_frc"
+	emit_json
+	exit "$_frc"
+}
+
+cleanup_on_exit() {
+	_trc=$?
+	if [ "${JSON_MODE:-0}" -eq 1 ] && [ "${JSON_EMITTED:-0}" -eq 0 ] && [ -n "${JSON_STATE:-}" ] && [ -d "$JSON_STATE" ]; then
+		if [ "${HOST_MUTATED:-0}" -eq 1 ]; then
+			_trc=2
+		elif [ "$_trc" -eq 0 ]; then
+			_trc=1
+		fi
+		json_set_meta ok "false"
+		json_set_meta exit_code "$_trc"
+		if [ ! -s "$JSON_STATE/blockers.txt" ] && [ ! -s "$JSON_STATE/errors.txt" ]; then
+			if [ "${HOST_MUTATED:-0}" -eq 1 ]; then
+				json_add_list errors "command aborted unexpectedly"
+			else
+				json_add_list blockers "command aborted before modifying the host"
+			fi
+		fi
+		emit_json || true
+		[ -n "${JSON_DIR:-}" ] && rm -rf "$JSON_DIR"
+		exit "$_trc"
+	fi
+	[ -n "${JSON_DIR:-}" ] && rm -rf "$JSON_DIR"
+}
+
+record_blocker() {
+	err "$1"
+	json_add_list blockers "$1"
+}
+
+record_warn() {
+	warn "$1"
+	json_add_list warnings "$1"
+}
+
+record_error() {
+	err "$1"
+	json_add_list errors "$1"
+}
+
 require_root() {
 	if [ "$(id -u)" -ne 0 ]; then
-		err "must run as root"
-		exit 1
+		record_blocker "must run as root"
+		finish_rc 1
 	fi
 }
 
@@ -89,14 +265,26 @@ service_backend_of() {
 	pman --url "unix://$_sock" info --format '{{.Host.NetworkBackend}}' 2>/dev/null || true
 }
 
-stale_cni_conf_files() {
+stale_backend_conf_files() {
+	_target_be="$1"
 	for _cf in "$CONTAINERS_CONF_DIR/containers.conf" "$CONTAINERS_CONF_DIR"/containers.conf.d/*.conf; do
 		[ -f "$_cf" ] || continue
 		[ "$_cf" = "$CONF_DROPIN" ] && continue
-		if grep -Eq '^[[:space:]]*network_backend[[:space:]]*=[[:space:]]*"cni"' "$_cf"; then
+		if grep -Eq "^[[:space:]]*network_backend[[:space:]]*=[[:space:]]*\"${_target_be}\"" "$_cf"; then
 			printf '%s\n' "$_cf"
 		fi
 	done
+}
+
+stale_cni_conf_files() {
+	stale_backend_conf_files cni
+}
+
+has_csv_token() {
+	case ",$1," in
+		*,"$2",*) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 nv_networks_csv() {
@@ -128,10 +316,41 @@ vlanfilter_bridges_csv() {
 }
 
 host_53_listener() {
-	sockstat -46l 2>/dev/null | awk 'NR > 1 && $6 == "*:53" && !seen[$2,$3]++ { printf "%s (pid %s) ", $2, $3 }'
+	sockstat -46l 2>/dev/null | awk 'NR > 1 && ($6 == "*:53" || $6 == "0.0.0.0:53" || $6 == "[::]:53") && !seen[$2,$3]++ { printf "%s (pid %s) ", $2, $3 }'
 }
 
-# Pure-Lua JSON parser + migration planners wrapped via flua.
+free_dns_port() {
+	_used=$(sockstat -46l 2>/dev/null | awk 'NR > 1 { print $6 }' || true)
+	_p="$DEFAULT_DNS_BIND_PORT"
+	_limit=$((DEFAULT_DNS_BIND_PORT + 50))
+	while [ "$_p" -lt "$_limit" ]; do
+		if ! printf '%s\n' "$_used" | grep -Eq ":${_p}$"; then
+			printf '%s\n' "$_p"
+			return 0
+		fi
+		_p=$((_p + 1))
+	done
+	printf '%s\n' "$DEFAULT_DNS_BIND_PORT"
+}
+
+pf_active_anchors_ok() {
+	_nat=$(pfctl -s nat 2>/dev/null || true)
+	_rules=$(pfctl -s rules 2>/dev/null || true)
+	case "$_nat" in
+		*'nat-anchor "netavark/*"'*) ;;
+		*) return 1 ;;
+	esac
+	case "$_nat" in
+		*'rdr-anchor "netavark/*"'*) ;;
+		*) return 1 ;;
+	esac
+	if printf '%s\n' "$_rules" | grep -Eq '^[[:space:]]*anchor[[:space:]]+"netavark/\*"'; then
+		return 0
+	fi
+	return 1
+}
+
+# Pure-Lua JSON parser/encoder + migration planners wrapped via flua.
 run_lua() {
 	"$FLUA_BIN" - "$@" <<'LUA'
 local mode = arg[1]
@@ -142,6 +361,85 @@ end
 
 local function sh_quote(s)
 	return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local array_mt = {}
+local function make_array(t)
+	return setmetatable(t or {}, array_mt)
+end
+
+local function json_escape_str(s)
+	s = tostring(s)
+	local out = { '"' }
+	for i = 1, #s do
+		local b = s:byte(i)
+		if b == 34 then out[#out + 1] = '\\"'
+		elseif b == 92 then out[#out + 1] = '\\\\'
+		elseif b == 8 then out[#out + 1] = '\\b'
+		elseif b == 12 then out[#out + 1] = '\\f'
+		elseif b == 10 then out[#out + 1] = '\\n'
+		elseif b == 13 then out[#out + 1] = '\\r'
+		elseif b == 9 then out[#out + 1] = '\\t'
+		elseif b < 32 then out[#out + 1] = string.format('\\u%04x', b)
+		else out[#out + 1] = string.char(b)
+		end
+	end
+	out[#out + 1] = '"'
+	return table.concat(out)
+end
+
+local function json_encode(val, indent, order_hint)
+	indent = indent or 0
+	local tv = type(val)
+	if val == nil then
+		return "null"
+	elseif tv == "boolean" then
+		return val and "true" or "false"
+	elseif tv == "number" then
+		return tostring(val)
+	elseif tv == "string" then
+		return json_escape_str(val)
+	elseif tv == "table" then
+		local pad = string.rep("  ", indent)
+		local ipad = string.rep("  ", indent + 1)
+		if getmetatable(val) == array_mt then
+			if #val == 0 then return "[]" end
+			local items = {}
+			for i = 1, #val do
+				items[#items + 1] = ipad .. json_encode(val[i], indent + 1, order_hint)
+			end
+			return "[\n" .. table.concat(items, ",\n") .. "\n" .. pad .. "]"
+		else
+			local keys = {}
+			local seen = {}
+			local hints = val.__order or (order_hint and order_hint[val])
+			if hints then
+				for _, k in ipairs(hints) do
+					if val[k] ~= nil then
+						keys[#keys + 1] = k
+						seen[k] = true
+					end
+				end
+			end
+			local extra = {}
+			for k in pairs(val) do
+				if k ~= "__order" and not seen[k] then
+					extra[#extra + 1] = tostring(k)
+				end
+			end
+			table.sort(extra)
+			for _, k in ipairs(extra) do
+				keys[#keys + 1] = k
+			end
+			if #keys == 0 then return "{}" end
+			local parts = {}
+			for _, k in ipairs(keys) do
+				parts[#parts + 1] = ipad .. json_escape_str(k) .. ": " .. json_encode(val[k], indent + 1, order_hint)
+			end
+			return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
+		end
+	end
+	return "null"
 end
 
 -- Minimal strict JSON parser for CNI conflists and podman inspect output.
@@ -380,17 +678,23 @@ local function exec_conflists()
 		local path = arg[i]
 		local text, rerr = read_file(path)
 		if not text then
-			print("BLOCKER\tcannot read " .. path .. ": " .. tostring(rerr))
+			local bmsg = "cannot read " .. path .. ": " .. tostring(rerr)
+			print("BLOCKER\t" .. bmsg)
+			print("NETPLAN\t" .. path .. "\tcni\t\tblocked\t" .. bmsg)
 		else
 			local ok, doc = pcall(json_decode, text)
 			if not ok or type(doc) ~= "table" then
-				print("BLOCKER\tinvalid JSON in " .. path .. ": " .. tostring(doc))
+				local bmsg = "invalid JSON in " .. path .. ": " .. tostring(doc)
+				print("BLOCKER\t" .. bmsg)
+				print("NETPLAN\t" .. path .. "\tcni\t\tblocked\t" .. bmsg)
 			else
 				local name = doc.name
 				local plugins = doc.plugins or { doc }
 				local main = plugins[1]
 				if not name or type(main) ~= "table" then
-					print("BLOCKER\t" .. path .. " missing name or plugins[1]")
+					local bmsg = path .. " missing name or plugins[1]"
+					print("BLOCKER\t" .. bmsg)
+					print("NETPLAN\t" .. tostring(name or path) .. "\tcni\t\tblocked\t" .. bmsg)
 				else
 					local ptype = tostring(main.type or "")
 					print("CNINET\t" .. name)
@@ -406,6 +710,7 @@ local function exec_conflists()
 							print("CNIBRIDGE\t" .. tostring(main.bridge))
 						end
 						print("INFO\t" .. name .. " -> already exists in netavark; will archive CNI conflist")
+						print("NETPLAN\t" .. name .. "\tcni-" .. ptype .. "\tnetavark\texists\t")
 					elseif ptype == "bridge" then
 						local br = tostring(main.bridge or "")
 						if br ~= "" then
@@ -418,11 +723,16 @@ local function exec_conflists()
 							local sub = (ranges[1] and ranges[1][1] and ranges[1][1].subnet) or ""
 							if sub == "10.88.0.0/16" or sub == "" then
 								print("INFO\t" .. name .. " -> built-in netavark default network (podman, 10.88.0.0/16)")
+								print("NETPLAN\t" .. name .. "\tcni-bridge\tpodman\tbuiltin\t")
 							else
-								print("BLOCKER\t" .. name .. " uses custom default subnet " .. sub .. "; rename before migrating")
+								local bmsg = name .. " uses custom default subnet " .. sub .. "; rename before migrating"
+								print("BLOCKER\t" .. bmsg)
+								print("NETPLAN\t" .. name .. "\tcni-bridge\tbridge\tblocked\t" .. bmsg)
 							end
 						elseif ipam.type ~= "host-local" and ipam.type ~= nil then
-							print("BLOCKER\t" .. name .. " (bridge) uses unsupported IPAM driver '" .. tostring(ipam.type) .. "'")
+							local bmsg = name .. " (bridge) uses unsupported IPAM driver '" .. tostring(ipam.type) .. "'"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\tcni-bridge\tbridge\tblocked\t" .. bmsg)
 						else
 							local cmd = { "podman", "network", "create" }
 							if not has_dnsname then
@@ -443,6 +753,7 @@ local function exec_conflists()
 							local plain_str = table.concat(cmd, " ")
 							print("CREATE\t" .. name .. "\tbridge" .. "\t" .. cmd_str)
 							print("INFO\t" .. name .. " (CNI bridge -> netavark bridge): " .. plain_str)
+							print("NETPLAN\t" .. name .. "\tcni-bridge\tbridge\twould_create\t")
 						end
 					elseif ptype == "epair" then
 						local master = tostring(main.master or main.bridge or "")
@@ -450,16 +761,28 @@ local function exec_conflists()
 						local itype = tostring(ipam.type or "host-local")
 						local has_vlan = (main.vlan ~= nil and tostring(main.vlan) ~= "")
 							or (main.taggedVlans ~= nil and tostring(main.taggedVlans) ~= "")
+						local cni_from = (itype == "dhcp" and "cni-epair-dhcp") or (has_vlan and "cni-epair-vlan") or "cni-epair"
+						local nv_to = (itype == "dhcp" and "epair-dhcp") or (has_vlan and "epair-vlan") or "epair-unmanaged"
 						if master == "" then
-							print("BLOCKER\t" .. name .. " (epair) has no master bridge configured")
+							local bmsg = name .. " (epair) has no master bridge configured"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\t" .. nv_to .. "\tblocked\t" .. bmsg)
 						elseif not ifaces[master] then
-							print("BLOCKER\t" .. name .. " (epair) host bridge '" .. master .. "' does not exist")
+							local bmsg = name .. " (epair) host bridge '" .. master .. "' does not exist"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\t" .. nv_to .. "\tblocked\t" .. bmsg)
 						elseif has_vlan and type(main.taggedVlans) == "table" then
-							print("BLOCKER\t" .. name .. " (epair VLAN) taggedVlans must be a string such as \"3,4\", not an array")
+							local bmsg = name .. " (epair VLAN) taggedVlans must be a string such as \"3,4\", not an array"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\t" .. nv_to .. "\tblocked\t" .. bmsg)
 						elseif (itype == "dhcp" or (itype == "host-local" and has_vlan)) and not has_epair_nv then
-							print("BLOCKER\t" .. name .. " (epair " .. itype .. ") requires " .. epair_nv .. " (cni-epair with netavark mode)")
+							local bmsg = name .. " (epair " .. itype .. ") requires " .. epair_nv .. " (cni-epair with netavark mode)"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\t" .. nv_to .. "\tblocked\t" .. bmsg)
 						elseif has_vlan and not vlan_ifaces[master] then
-							print("BLOCKER\t" .. name .. " (epair VLAN) host bridge '" .. master .. "' does not have vlanfilter enabled; run: ifconfig " .. master .. " vlanfilter")
+							local bmsg = name .. " (epair VLAN) host bridge '" .. master .. "' does not have vlanfilter enabled; run: ifconfig " .. master .. " vlanfilter"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\t" .. nv_to .. "\tblocked\t" .. bmsg)
 						elseif itype == "dhcp" then
 							local cmd = {
 								"podman", "network", "create", "--disable-dns",
@@ -480,6 +803,7 @@ local function exec_conflists()
 							for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
 							print("CREATE\t" .. name .. "\tepair-dhcp\t" .. table.concat(q, " "))
 							print("INFO\t" .. name .. " (CNI epair DHCP -> netavark epair plugin): " .. table.concat(cmd, " "))
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\tepair-dhcp\twould_create\t")
 						elseif itype == "host-local" then
 							if has_vlan then
 								local cmd = {
@@ -501,6 +825,7 @@ local function exec_conflists()
 								for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
 								print("CREATE\t" .. name .. "\tepair-vlan\t" .. table.concat(q, " "))
 								print("INFO\t" .. name .. " (CNI epair host-local VLAN -> netavark epair plugin on " .. master .. "): " .. table.concat(cmd, " "))
+								print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\tepair-vlan\twould_create\t")
 							else
 								local cmd = {
 									"podman", "network", "create", "--disable-dns",
@@ -516,12 +841,17 @@ local function exec_conflists()
 								for _, tok in ipairs(cmd) do q[#q + 1] = sh_quote(tok) end
 								print("CREATE\t" .. name .. "\tepair-unmanaged\t" .. table.concat(q, " "))
 								print("INFO\t" .. name .. " (CNI epair host-local -> unmanaged bridge on " .. master .. "): " .. table.concat(cmd, " "))
+								print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\tepair-unmanaged\twould_create\t")
 							end
 						else
-							print("BLOCKER\t" .. name .. " (epair) uses unsupported IPAM driver '" .. itype .. "'")
+							local bmsg = name .. " (epair) uses unsupported IPAM driver '" .. itype .. "'"
+							print("BLOCKER\t" .. bmsg)
+							print("NETPLAN\t" .. name .. "\t" .. cni_from .. "\t" .. nv_to .. "\tblocked\t" .. bmsg)
 						end
 					else
-						print("BLOCKER\t" .. name .. " uses unsupported CNI plugin '" .. ptype .. "'")
+						local bmsg = name .. " uses unsupported CNI plugin '" .. ptype .. "'"
+						print("BLOCKER\t" .. bmsg)
+						print("NETPLAN\t" .. name .. "\tcni-" .. ptype .. "\t\tblocked\t" .. bmsg)
 					end
 				end
 			end
@@ -568,16 +898,7 @@ local function csv_set(csv)
 	return s
 end
 
-local function exec_containers()
-	local inspect_path = arg[2]
-	local running_path = arg[3] or ""
-	local recreate_path = arg[4] or ""
-	local pmajor = tonumber(arg[5]) or 0
-	local cni_nets = csv_set(arg[6])
-	local nv_nets = csv_set(arg[7])
-	local stop_now_path = arg[8] or ""
-	local ps_nets_path = arg[9] or ""
-	local host_net_work = (tonumber(arg[10]) or 1) ~= 0
+local function read_ps_nets(ps_nets_path)
 	local ps_nets_by_name = {}
 	if ps_nets_path ~= "" then
 		local pt = read_file(ps_nets_path)
@@ -590,6 +911,47 @@ local function exec_containers()
 			end
 		end
 	end
+	return ps_nets_by_name
+end
+
+local function extract_ctr_nets(c, ps_nets_by_name)
+	local name = tostring(c.Name or "")
+	local net_map = (c.NetworkSettings and c.NetworkSettings.Networks) or {}
+	local nets = {}
+	local live = {}
+	for k, v in pairs(net_map) do
+		nets[#nets + 1] = k
+		if type(v) == "table" then
+			local parts = {}
+			if v.IPAddress and v.IPAddress ~= "" then parts[#parts + 1] = v.IPAddress end
+			if v.MacAddress and v.MacAddress ~= "" then parts[#parts + 1] = v.MacAddress end
+			if #parts > 0 then
+				live[#live + 1] = k .. ":" .. table.concat(parts, "/")
+			end
+		end
+	end
+	if #nets == 0 and ps_nets_by_name[name] then
+		for tok in ps_nets_by_name[name]:gmatch("[^,]+") do
+			tok = trim(tok)
+			if tok ~= "" then
+				nets[#nets + 1] = tok
+			end
+		end
+	end
+	return nets, live
+end
+
+local function exec_containers()
+	local inspect_path = arg[2]
+	local running_path = arg[3] or ""
+	local recreate_path = arg[4] or ""
+	local pmajor = tonumber(arg[5]) or 0
+	local cni_nets = csv_set(arg[6])
+	local nv_nets = csv_set(arg[7])
+	local stop_now_path = arg[8] or ""
+	local ps_nets_path = arg[9] or ""
+	local host_net_work = (tonumber(arg[10]) or 1) ~= 0
+	local ps_nets_by_name = read_ps_nets(ps_nets_path)
 	local text, rerr = read_file(inspect_path)
 	if not text or trim(text) == "" then
 		return
@@ -608,30 +970,9 @@ local function exec_containers()
 		local err_str = tostring((c.State and c.State.Error) or "")
 		local stopped_by_user = (c.State and c.State.StoppedByUser == true)
 		local rp = tostring((c.HostConfig and c.HostConfig.RestartPolicy and c.HostConfig.RestartPolicy.Name) or "")
-		local net_map = (c.NetworkSettings and c.NetworkSettings.Networks) or {}
-		local nets = {}
-		local live = {}
+		local nets, live = extract_ctr_nets(c, ps_nets_by_name)
 		local uses_custom_cni = false
 		local missing_net = nil
-		for k, v in pairs(net_map) do
-			nets[#nets + 1] = k
-			if type(v) == "table" then
-				local parts = {}
-				if v.IPAddress and v.IPAddress ~= "" then parts[#parts + 1] = v.IPAddress end
-				if v.MacAddress and v.MacAddress ~= "" then parts[#parts + 1] = v.MacAddress end
-				if #parts > 0 then
-					live[#live + 1] = k .. ":" .. table.concat(parts, "/")
-				end
-			end
-		end
-		if #nets == 0 and ps_nets_by_name[name] then
-			for tok in ps_nets_by_name[name]:gmatch("[^,]+") do
-				tok = trim(tok)
-				if tok ~= "" then
-					nets[#nets + 1] = tok
-				end
-			end
-		end
 		for _, k in ipairs(nets) do
 			if k ~= "podman" and k ~= "bridge" and k ~= "default" then
 				if cni_nets[k] and not nv_nets[k] then
@@ -679,6 +1020,7 @@ local function exec_containers()
 				else
 					action = "keep stopped (missing CNI conflist for '" .. missing_net .. "')"
 					print("WARN\tcontainer " .. name .. " failed with 'network not found' for '" .. missing_net .. "', which has no CNI conflist")
+					print("NEED_RECREATE\t" .. name)
 				end
 			elseif (not stopped_by_user) and (rp == "always" or rp == "unless-stopped") and uses_custom_cni then
 				state_label = "stopped (restart=" .. rp .. ")"
@@ -728,10 +1070,15 @@ local function exec_pf()
 	local pf_action = arg[2]
 	local pf_path = arg[3]
 	local out_path = arg[4] or ""
+	local create_missing = (arg[5] == "1")
 	local text, rerr = read_file(pf_path)
 	if not text then
-		print("MISSING\t" .. tostring(rerr))
-		return
+		if pf_action == "update" and create_missing then
+			text = ""
+		else
+			print("MISSING\t" .. tostring(rerr))
+			return
+		end
 	end
 
 	local lines = {}
@@ -742,11 +1089,9 @@ local function exec_pf()
 		table.remove(lines)
 	end
 
-	local has_sub, has_iso, has_nat, has_rdr, has_flt = false, false, false, false, false
+	local has_nat, has_rdr, has_flt = false, false, false
 	for _, line in ipairs(lines) do
 		if not line:match("^%s*#") then
-			if line:match("^%s*table%s+<netavark%-subnets>") then has_sub = true end
-			if line:match("^%s*table%s+<netavark%-isolated>") then has_iso = true end
 			if line:match('^%s*nat%-anchor%s+"netavark/%*"') then has_nat = true end
 			if line:match('^%s*rdr%-anchor%s+"netavark/%*"') then has_rdr = true end
 			if line:match('^%s*anchor%s+"netavark/%*"') then has_flt = true end
@@ -754,15 +1099,13 @@ local function exec_pf()
 	end
 
 	local missing = {}
-	if not has_sub then missing[#missing + 1] = "table <netavark-subnets> persist" end
-	if not has_iso then missing[#missing + 1] = "table <netavark-isolated> persist" end
 	if not has_nat then missing[#missing + 1] = 'nat-anchor "netavark/*"' end
 	if not has_rdr then missing[#missing + 1] = 'rdr-anchor "netavark/*"' end
 	if not has_flt then missing[#missing + 1] = 'anchor "netavark/*"' end
 
 	if pf_action == "check" then
 		if #missing == 0 then
-			print("OK\tall netavark tables and anchors present in " .. pf_path)
+			print("OK\tall netavark anchors present in " .. pf_path)
 		else
 			print("MISSING\t" .. table.concat(missing, "; "))
 		end
@@ -774,33 +1117,9 @@ local function exec_pf()
 		return
 	end
 
-	local tbl_kws = {
-		scrub = true, altq = true, queue = true,
-		nat = true, rdr = true, binat = true,
-		["nat-anchor"] = true, ["rdr-anchor"] = true, ["binat-anchor"] = true,
-		antispoof = true, anchor = true, block = true, pass = true
-	}
 	local flt_kws = {
-		antispoof = true, anchor = true, block = true, pass = true
+		antispoof = true, anchor = true, block = true, match = true, pass = true
 	}
-
-	local to_tbl = {}
-	if not has_sub then to_tbl[#to_tbl + 1] = "table <netavark-subnets> persist" end
-	if not has_iso then to_tbl[#to_tbl + 1] = "table <netavark-isolated> persist" end
-
-	if #to_tbl > 0 then
-		local idx = #lines + 1
-		for i, line in ipairs(lines) do
-			local kw = first_kw(line)
-			if kw and tbl_kws[kw] then
-				idx = i
-				break
-			end
-		end
-		for j = #to_tbl, 1, -1 do
-			table.insert(lines, idx, to_tbl[j])
-		end
-	end
 
 	local to_xlate = {}
 	if not has_nat then to_xlate[#to_xlate + 1] = 'nat-anchor "netavark/*"' end
@@ -830,12 +1149,229 @@ local function exec_pf()
 	print("UPDATED\t" .. table.concat(missing, "; "))
 end
 
+local function exec_dnsport()
+	local port = 0
+	local file = ""
+	for i = 2, #arg do
+		local path = arg[i]
+		local text = read_file(path)
+		if text then
+			local section = ""
+			for raw in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+				local l = trim(raw:gsub("#.*$", ""))
+				if l:match("^%[.*%]$") then
+					section = trim(l:sub(2, -2))
+				elseif section == "network" then
+					local k, v = l:match("^([%w_]+)%s*=%s*(.+)$")
+					if k == "dns_bind_port" then
+						local n = tonumber(trim(v))
+						if n and n > 0 and n < 65536 then
+							port = math.floor(n)
+							file = path
+						end
+					end
+				end
+			end
+		end
+	end
+	print(string.format("%d\t%s", port, file))
+end
+
+local function read_lines_unique(path)
+	local out = make_array({})
+	local seen = {}
+	local text = read_file(path)
+	if not text then return out end
+	for line in text:gmatch("[^\r\n]+") do
+		line = trim(line)
+		if line ~= "" and not seen[line] then
+			seen[line] = true
+			out[#out + 1] = line
+		end
+	end
+	return out
+end
+
+local function read_lines_all(path)
+	local out = make_array({})
+	local text = read_file(path)
+	if not text then return out end
+	for line in text:gmatch("[^\r\n]+") do
+		line = trim(line)
+		if line ~= "" then
+			out[#out + 1] = line
+		end
+	end
+	return out
+end
+
+local function exec_emit_json()
+	local state_dir = arg[2]
+	local meta = {}
+	local mtext = read_file(state_dir .. "/meta.kv")
+	if mtext then
+		for line in mtext:gmatch("[^\r\n]+") do
+			local k, v = line:match("^([^\t]+)\t(.*)$")
+			if k then
+				meta[k] = v
+			end
+		end
+	end
+
+	local function mbool(k) return meta[k] == "true" end
+	local function mstr(k, d) return meta[k] or (d or "") end
+	local function mnum(k, d) return tonumber(meta[k]) or (d or 0) end
+
+	local nets = make_array({})
+	local nets_by_name = {}
+	local ntext = read_file(state_dir .. "/networks.tsv")
+	if ntext then
+		for line in ntext:gmatch("[^\r\n]+") do
+			local f1, f2, f3, f4, f5 = line:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
+			if f1 and f1 ~= "" then
+				local entry = nets_by_name[f1]
+				if not entry then
+					entry = {
+						__order = { "name", "from", "to", "result", "error" },
+						name = f1,
+						from = f2,
+						to = f3,
+						result = f4,
+					}
+					if f5 ~= "" then entry.error = f5 end
+					nets[#nets + 1] = entry
+					nets_by_name[f1] = entry
+				else
+					if f2 ~= "" then entry.from = f2 end
+					if f3 ~= "" then entry.to = f3 end
+					if f4 ~= "" then entry.result = f4 end
+					if f5 ~= "" then
+						entry.error = f5
+					else
+						entry.error = nil
+					end
+				end
+			end
+		end
+	end
+
+	local doc = {
+		__order = {
+			"version", "action", "ok", "exit_code", "changed", "no_start",
+			"pf", "sysctl", "loader", "dns_bind_port", "backend", "networks",
+			"kept_netavark_networks", "containers_started",
+			"containers_need_recreating", "containers_failed",
+			"blockers", "warnings", "errors", "backups"
+		},
+		version = mnum("version", 2),
+		action = mstr("action", "check"),
+		ok = mbool("ok"),
+		exit_code = mnum("exit_code", 1),
+		changed = mbool("changed"),
+		no_start = mbool("no_start"),
+		pf = {
+			__order = { "changed", "status", "detail" },
+			changed = mbool("pf_changed"),
+			status = mstr("pf_status", "unchanged"),
+			detail = mstr("pf_detail", ""),
+		},
+		sysctl = {
+			__order = { "changed", "status", "detail" },
+			changed = mbool("sysctl_changed"),
+			status = mstr("sysctl_status", "unchanged"),
+			detail = mstr("sysctl_detail", ""),
+		},
+		loader = {
+			__order = { "changed", "status", "detail" },
+			changed = mbool("loader_changed"),
+			status = mstr("loader_status", "unchanged"),
+			detail = mstr("loader_detail", ""),
+		},
+		dns_bind_port = {
+			__order = { "changed", "status", "port", "file" },
+			changed = mbool("dns_changed"),
+			status = mstr("dns_status", "unchanged"),
+			port = mnum("dns_port", 53),
+			file = mstr("dns_file", ""),
+		},
+		backend = {
+			__order = { "changed", "from", "to", "service" },
+			changed = mbool("backend_changed"),
+			from = mstr("backend_from", "unknown"),
+			to = mstr("backend_to", "unknown"),
+			service = mstr("backend_service", ""),
+		},
+		networks = nets,
+		kept_netavark_networks = read_lines_unique(state_dir .. "/kept_nv.txt"),
+		containers_started = read_lines_unique(state_dir .. "/started.txt"),
+		containers_need_recreating = read_lines_unique(state_dir .. "/recreate.txt"),
+		containers_failed = read_lines_unique(state_dir .. "/failed_ctrs.txt"),
+		blockers = read_lines_all(state_dir .. "/blockers.txt"),
+		warnings = read_lines_all(state_dir .. "/warnings.txt"),
+		errors = read_lines_all(state_dir .. "/errors.txt"),
+		backups = {
+			__order = {
+				"state_dir", "pf_conf", "cni_conflists",
+				"before_netavark_conflists", "netavark_networks",
+				"recreate_commands", "containers_conf"
+			},
+			state_dir = mstr("backup_state_dir", ""),
+			pf_conf = mstr("backup_pf_conf", ""),
+			cni_conflists = mstr("backup_cni_conflists", ""),
+			before_netavark_conflists = mstr("backup_before_netavark", ""),
+			netavark_networks = mstr("backup_netavark_networks", ""),
+			recreate_commands = mstr("backup_recreate_commands", ""),
+			containers_conf = mstr("backup_containers_conf", ""),
+		},
+	}
+	print(json_encode(doc, 0))
+end
+
+local function exec_jsonname()
+	local path = arg[2]
+	local text = read_file(path)
+	if text then
+		local ok, doc = pcall(json_decode, text)
+		if ok and type(doc) == "table" and doc.name and tostring(doc.name) ~= "" then
+			print(tostring(doc.name))
+			return
+		end
+	end
+	local base = path:match("([^/]+)$") or path
+	base = base:gsub("%.conflist$", ""):gsub("%.conf$", ""):gsub("%.json$", "")
+	print(base)
+end
+
+local function exec_ctrnets()
+	local inspect_path = arg[2]
+	local ps_nets_by_name = read_ps_nets(arg[3] or "")
+	local text = read_file(inspect_path)
+	if not text or trim(text) == "" then return end
+	local arr = json_decode(text)
+	if type(arr) ~= "table" then error("inspect output is not an array") end
+	for _, c in ipairs(arr) do
+		local name = tostring(c.Name or "")
+		local is_running = (c.State and c.State.Running == true) and "true" or "false"
+		local nets = extract_ctr_nets(c, ps_nets_by_name)
+		table.sort(nets)
+		print(string.format("%s\t%s\t%s", name, is_running, table.concat(nets, ",")))
+	end
+end
+
 if mode == "conflists" then
 	exec_conflists()
 elseif mode == "containers" then
 	exec_containers()
 elseif mode == "pf" then
 	exec_pf()
+elseif mode == "jsonname" then
+	exec_jsonname()
+elseif mode == "ctrnets" then
+	exec_ctrnets()
+elseif mode == "dnsport" then
+	exec_dnsport()
+elseif mode == "emit_json" then
+	exec_emit_json()
 else
 	error("unknown lua mode: " .. tostring(mode))
 end
@@ -852,6 +1388,116 @@ collect_conflist_files() {
 	fi
 }
 
+detect_dns_bind_port() {
+	run_lua dnsport "$CONTAINERS_CONF_DIR/containers.conf" "$CONTAINERS_CONF_DIR"/containers.conf.d/*.conf
+}
+
+append_sysctl_filter_local() {
+	mkdir -p "$(dirname "$SYSCTL_CONF")"
+	if [ -f "$SYSCTL_CONF" ] && grep -Eq '^[[:space:]]*net\.pf\.filter_local[[:space:]]*=' "$SYSCTL_CONF"; then
+		sed -i '' -E 's/^[[:space:]]*net\.pf\.filter_local[[:space:]]*=.*/net.pf.filter_local=1/' "$SYSCTL_CONF"
+	elif [ -s "$SYSCTL_CONF" ] && [ -n "$(tail -c 1 "$SYSCTL_CONF")" ]; then
+		printf '\nnet.pf.filter_local=1\n' >> "$SYSCTL_CONF"
+	else
+		printf 'net.pf.filter_local=1\n' >> "$SYSCTL_CONF"
+	fi
+}
+
+probe_host_json_state() {
+	_ph_be="$1"
+	_ph_svc="$2"
+
+	if [ -f "$SYSCTL_CONF" ] && grep -Eq '^[[:space:]]*net\.pf\.filter_local[[:space:]]*=[[:space:]]*1([[:space:]]*(#.*)?)?$' "$SYSCTL_CONF"; then
+		SYSCTL_CONF_OK=1
+	else
+		SYSCTL_CONF_OK=0
+	fi
+	FILTER_LOCAL=$(sysctl -n net.pf.filter_local 2>/dev/null || printf '0')
+	if [ "$FILTER_LOCAL" = "1" ] && [ "$SYSCTL_CONF_OK" -eq 1 ]; then
+		json_set_meta sysctl_changed false
+		json_set_meta sysctl_status ok
+		json_set_meta sysctl_detail "net.pf.filter_local=1"
+	else
+		json_set_meta sysctl_changed false
+		json_set_meta sysctl_status would_update
+		json_set_meta sysctl_detail "net.pf.filter_local=$FILTER_LOCAL (conf=$SYSCTL_CONF_OK)"
+	fi
+
+	_cur_pfload=$(sysrc -f "$LOADER_CONF" -qn pf_load 2>/dev/null || true)
+	if [ "$_cur_pfload" = "YES" ] || [ "$_cur_pfload" = "yes" ]; then
+		LOADER_CONF_OK=1
+		json_set_meta loader_changed false
+		json_set_meta loader_status ok
+		json_set_meta loader_detail "pf_load=YES in $LOADER_CONF"
+	else
+		LOADER_CONF_OK=0
+		json_set_meta loader_changed false
+		json_set_meta loader_status would_update
+		json_set_meta loader_detail "pf_load=${_cur_pfload:-unset} in $LOADER_CONF"
+	fi
+
+	DNS_CUR=$(detect_dns_bind_port)
+	CUR_DNS_PORT=${DNS_CUR%%	*}
+	CUR_DNS_FILE=${DNS_CUR#*	}
+	[ "$CUR_DNS_PORT" != "$DNS_CUR" ] || CUR_DNS_FILE=""
+	DNS53=$(host_53_listener)
+	DNS_NEEDS_CFG=0
+	if [ "$CUR_DNS_PORT" -gt 0 ]; then
+		json_set_meta dns_changed false
+		json_set_meta dns_status already_set
+		json_set_meta dns_port "$CUR_DNS_PORT"
+		json_set_meta dns_file "$CUR_DNS_FILE"
+	elif [ -n "$DNS53" ]; then
+		DNS_NEEDS_CFG=1
+		PICK_DNS_PORT=$(free_dns_port)
+		json_set_meta dns_changed false
+		json_set_meta dns_status would_update
+		json_set_meta dns_port "$PICK_DNS_PORT"
+		json_set_meta dns_file "$DNS_CONF_DROPIN"
+	else
+		json_set_meta dns_changed false
+		json_set_meta dns_status ok
+		json_set_meta dns_port "53"
+		json_set_meta dns_file ""
+	fi
+
+	PF_STATUS=""
+	if [ ! -f "$PF_CONF" ]; then
+		json_set_meta pf_changed false
+		json_set_meta pf_status blocked
+		json_set_meta pf_detail "$PF_CONF not found"
+	elif ! pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+		json_set_meta pf_changed false
+		json_set_meta pf_status blocked
+		json_set_meta pf_detail "pf is not enabled"
+	else
+		PF_STATUS=$(run_lua pf check "$PF_CONF")
+		case "$PF_STATUS" in
+			OK*)
+				if pf_active_anchors_ok; then
+					json_set_meta pf_changed false
+					json_set_meta pf_status ok
+					json_set_meta pf_detail "${PF_STATUS#OK	}"
+				else
+					json_set_meta pf_changed false
+					json_set_meta pf_status would_update
+					json_set_meta pf_detail "netavark anchors in $PF_CONF are not loaded in active ruleset"
+				fi
+				;;
+			MISSING*)
+				json_set_meta pf_changed false
+				json_set_meta pf_status would_update
+				json_set_meta pf_detail "${PF_STATUS#MISSING	}"
+				;;
+		esac
+	fi
+
+	json_set_meta backend_changed false
+	json_set_meta backend_from "$_ph_be"
+	json_set_meta backend_to "netavark"
+	json_set_meta backend_service "$_ph_svc"
+}
+
 run_preflight() {
 	BLOCKERS=0
 	WARNINGS=0
@@ -866,6 +1512,7 @@ run_preflight() {
 	: > "$PLAN_CREATE_FILE"
 	: > "$PLAN_BRIDGES_FILE"
 	: > "$PLAN_RUN_FILE"
+	: > "$PLAN_RECREATE_FILE"
 	: > "$PLAN_STOP_NOW_FILE"
 	PODMAN_CONF_OVERRIDE=""
 
@@ -886,7 +1533,6 @@ EOF
 	fi
 	say "  backend: $BACKEND"
 	SVC_MISMATCH=0
-	DNS_NEEDS_CFG=0
 	SVC_SOCK=$(podman_service_socket)
 	SVC_BACKEND=$(service_backend_of)
 	if [ -n "$SVC_BACKEND" ]; then
@@ -894,27 +1540,31 @@ EOF
 			say "  podman_service: $SVC_BACKEND ($SVC_SOCK, matches config)"
 		else
 			say "  podman_service: $SVC_BACKEND ($SVC_SOCK) != configured '$BACKEND'"
-			warn "running podman_service uses '$SVC_BACKEND' while configuration selects '$BACKEND'; fix: service podman_service restart"
+			record_warn "running podman_service uses '$SVC_BACKEND' while configuration selects '$BACKEND'; fix: service podman_service restart"
 			WARNINGS=$((WARNINGS + 1))
 			SVC_MISMATCH=1
 		fi
 	fi
+
+	probe_host_json_state "$BACKEND" "$SVC_BACKEND"
+
 	if [ "$PMAJOR" -lt 6 ]; then
 		if [ "$BACKEND" = "netavark" ] && [ "$SVC_MISMATCH" -eq 0 ]; then
 			say "  already running on netavark"
 			if [ -d "$STATE_DIR" ]; then
 				say "  rollback state present in $STATE_DIR (run 'netavark-migrate back' to return to CNI)"
 			fi
+			json_set_meta backend_to "netavark"
 			return 2
 		fi
 		if [ "$BACKEND" != "cni" ] && [ "$BACKEND" != "netavark" ]; then
-			err "unexpected Podman network backend '$BACKEND'"
+			record_blocker "unexpected Podman network backend '$BACKEND'"
 			BLOCKERS=$((BLOCKERS + 1))
 		fi
 	else
 		say "  mode: Podman 6 post-upgrade recovery (CNI backend removed in Podman 6)"
 		if [ "$BACKEND" != "netavark" ]; then
-			err "unexpected Podman network backend '$BACKEND'"
+			record_blocker "unexpected Podman network backend '$BACKEND'"
 			BLOCKERS=$((BLOCKERS + 1))
 		fi
 		if [ -n "$STALE_CNI_CONFS" ]; then
@@ -927,14 +1577,14 @@ EOF
 	if [ -x "$NETAVARK_BIN" ]; then
 		say "  netavark binary: ok ($NETAVARK_BIN)"
 	else
-		err "blocker: netavark binary missing at $NETAVARK_BIN"
+		record_blocker "blocker: netavark binary missing at $NETAVARK_BIN"
 		BLOCKERS=$((BLOCKERS + 1))
 	fi
 
 	if [ -x "$AARDVARK_BIN" ]; then
 		say "  aardvark-dns binary: ok ($AARDVARK_BIN)"
 	else
-		err "blocker: aardvark-dns binary missing at $AARDVARK_BIN"
+		record_blocker "blocker: aardvark-dns binary missing at $AARDVARK_BIN"
 		BLOCKERS=$((BLOCKERS + 1))
 	fi
 
@@ -942,25 +1592,23 @@ EOF
 	AARD_VER=$(pkg query '%v' aardvark-dns 2>/dev/null || printf 'unknown')
 	if [ "$INOTIFY" = "-1" ]; then
 		if [ "$AARD_VER" != "unknown" ] && [ "$(pkg version -t "$AARD_VER" "2.1.0_3")" != "<" ]; then
-			warn "vfs.inotify.max_user_instances=-1 (covered by aardvark-dns $AARD_VER patch; default is 256)"
+			record_warn "vfs.inotify.max_user_instances=-1 (covered by aardvark-dns $AARD_VER patch; default is 256)"
 			WARNINGS=$((WARNINGS + 1))
 		else
-			err "blocker: vfs.inotify.max_user_instances=-1 causes aardvark-dns ($AARD_VER) to abort; set sysctl vfs.inotify.max_user_instances=256 or upgrade aardvark-dns >= 2.1.0_3"
+			record_blocker "blocker: vfs.inotify.max_user_instances=-1 causes aardvark-dns ($AARD_VER) to abort; set sysctl vfs.inotify.max_user_instances=256 or upgrade aardvark-dns >= 2.1.0_3"
 			BLOCKERS=$((BLOCKERS + 1))
 		fi
 	else
 		say "  vfs.inotify.max_user_instances: $INOTIFY (ok)"
 	fi
 
-	PF_STATUS=""
 	if [ ! -f "$PF_CONF" ]; then
-		err "blocker: $PF_CONF not found"
+		record_blocker "blocker: $PF_CONF not found"
 		BLOCKERS=$((BLOCKERS + 1))
 	elif ! pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
-		err "blocker: pf is not enabled (enable pf before migrating)"
+		record_blocker "blocker: pf is not enabled (enable pf before migrating)"
 		BLOCKERS=$((BLOCKERS + 1))
 	else
-		PF_STATUS=$(run_lua pf check "$PF_CONF")
 		case "$PF_STATUS" in
 			OK*)
 				say "  pf: enabled; ${PF_STATUS#OK	}"
@@ -971,8 +1619,7 @@ EOF
 		esac
 	fi
 
-	FILTER_LOCAL=$(sysctl -n net.pf.filter_local 2>/dev/null || printf '0')
-	if [ "$FILTER_LOCAL" = "1" ]; then
+	if [ "$FILTER_LOCAL" = "1" ] && [ "$SYSCTL_CONF_OK" -eq 1 ]; then
 		say "  net.pf.filter_local: 1 (ok)"
 	else
 		say "  net.pf.filter_local: $FILTER_LOCAL -> will set 1, add to $SYSCTL_CONF, pf_load=YES in $LOADER_CONF, and reload pf"
@@ -985,21 +1632,16 @@ EOF
 		say "  net.inet.ip.forwarding: $IP_FWD -> will set 1 and gateway_enable=YES"
 	fi
 
-	DNS53=$(host_53_listener)
-	DNS_NEEDS_CFG=0
-	if [ -n "$DNS53" ]; then
-		if grep -Eq '^[[:space:]]*dns_bind_port[[:space:]]*=' "$CONTAINERS_CONF_DIR/containers.conf" "$CONTAINERS_CONF_DIR"/containers.conf.d/*.conf 2>/dev/null; then
-			say "  *:53 listener: $DNS53(dns_bind_port already configured)"
-		else
-			DNS_NEEDS_CFG=1
-			say "  *:53 listener: $DNS53-> will set dns_bind_port = $DEFAULT_DNS_BIND_PORT in $CONF_DROPIN"
-		fi
+	if [ "$CUR_DNS_PORT" -gt 0 ]; then
+		say "  *:53 listener: ${DNS53:-none }(dns_bind_port = $CUR_DNS_PORT already configured in $CUR_DNS_FILE)"
+	elif [ -n "$DNS53" ]; then
+		say "  *:53 listener: $DNS53-> will set dns_bind_port = $PICK_DNS_PORT in $DNS_CONF_DROPIN"
 	else
 		say "  *:53 listener: none (aardvark-dns will bind <gateway>:53)"
 	fi
 
 	if ! mount 2>/dev/null | grep -q ' on /dev/fd '; then
-		warn "/dev/fd (fdescfs) is not mounted; container restart policies require fdescfs"
+		record_warn "/dev/fd (fdescfs) is not mounted; container restart policies require fdescfs"
 		WARNINGS=$((WARNINGS + 1))
 	fi
 
@@ -1039,8 +1681,16 @@ EOF
 				CNIBRIDGE)
 					printf '%s\n' "$rest" >> "$PLAN_BRIDGES_FILE"
 					;;
+				NETPLAN)
+					_np_name=$(printf '%s' "$rest" | cut -f1)
+					_np_from=$(printf '%s' "$rest" | cut -f2)
+					_np_to=$(printf '%s' "$rest" | cut -f3)
+					_np_res=$(printf '%s' "$rest" | cut -f4)
+					_np_err=$(printf '%s' "$rest" | cut -f5-)
+					json_add_net "$_np_name" "$_np_from" "$_np_to" "$_np_res" "$_np_err"
+					;;
 				BLOCKER)
-					err "blocker: $rest"
+					record_blocker "blocker: $rest"
 					BLOCKERS=$((BLOCKERS + 1))
 					;;
 			esac
@@ -1058,7 +1708,12 @@ EOF
 	case "$PF_STATUS" in
 		MISSING*) HOST_NET_WORK=1 ;;
 	esac
+	if [ -f "$PF_CONF" ] && pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+		pf_active_anchors_ok || HOST_NET_WORK=1
+	fi
 	[ "$FILTER_LOCAL" != "1" ] && HOST_NET_WORK=1
+	[ "$SYSCTL_CONF_OK" -eq 0 ] && HOST_NET_WORK=1
+	[ "$LOADER_CONF_OK" -eq 0 ] && HOST_NET_WORK=1
 	[ "$IP_FWD" != "1" ] && HOST_NET_WORK=1
 	[ "$DNS_NEEDS_CFG" -eq 1 ] && HOST_NET_WORK=1
 	[ "$SVC_MISMATCH" -eq 1 ] && HOST_NET_WORK=1
@@ -1094,8 +1749,11 @@ EOF
 				P6_WORK)
 					P6_CTR_WORK="$rest"
 					;;
+				NEED_RECREATE)
+					json_add_list recreate "$rest"
+					;;
 				WARN)
-					warn "$rest"
+					record_warn "$rest"
 					WARNINGS=$((WARNINGS + 1))
 					;;
 			esac
@@ -1123,26 +1781,383 @@ EOF
 	return 0
 }
 
+apply_host_setup() {
+	_ah_work="$1"
+	_ah_create_pf="${2:-0}"
+	_ah_restart_svc="${3:-0}"
+
+	# 1. Pre-mutation checks (leave host unchanged if validation fails).
+	if [ ! -f "$PF_CONF" ] && [ "$_ah_create_pf" -ne 1 ]; then
+		if [ "$HOST_MUTATED" -eq 1 ]; then
+			record_error "$PF_CONF not found"
+			json_set_meta pf_status failed
+			json_set_meta pf_detail "$PF_CONF not found"
+			return 2
+		fi
+		record_blocker "blocker: $PF_CONF not found"
+		json_set_meta pf_status blocked
+		json_set_meta pf_detail "$PF_CONF not found"
+		return 1
+	fi
+
+	_ah_kld_loaded=0
+	if kldstat -q -m pf 2>/dev/null; then
+		_ah_kld_loaded=1
+	else
+		if ! kldload -n pf 2>/dev/null; then
+			if [ "$HOST_MUTATED" -eq 1 ]; then
+				record_error "failed to load pf kernel module"
+				json_set_meta pf_status failed
+				json_set_meta pf_detail "kldload pf failed"
+				return 2
+			fi
+			record_blocker "blocker: failed to load pf kernel module"
+			json_set_meta pf_status blocked
+			json_set_meta pf_detail "kldload pf failed"
+			return 1
+		fi
+	fi
+
+	PF_MOD=$(run_lua pf update "$PF_CONF" "$_ah_work/pf.conf.new" "$_ah_create_pf")
+	_ah_pf_cand="$PF_CONF"
+	case "$PF_MOD" in
+		UPDATED*)
+			_ah_pf_cand="$_ah_work/pf.conf.new"
+			;;
+		MISSING*)
+			_ah_msg="cannot update $PF_CONF: ${PF_MOD#MISSING	}"
+			if [ "$HOST_MUTATED" -eq 1 ]; then
+				record_error "$_ah_msg"
+				json_set_meta pf_status failed
+				json_set_meta pf_detail "$_ah_msg"
+				return 2
+			fi
+			record_blocker "blocker: $_ah_msg"
+			json_set_meta pf_status blocked
+			json_set_meta pf_detail "$_ah_msg"
+			return 1
+			;;
+	esac
+
+	set +e
+	_pf_val_err=$(pfctl -nf "$_ah_pf_cand" 2>&1)
+	_pf_val_rc=$?
+	set -e
+	if [ "$_pf_val_rc" -ne 0 ]; then
+		if [ "$HOST_MUTATED" -eq 1 ]; then
+			record_error "$PF_CONF syntax check failed: $_pf_val_err"
+			json_set_meta pf_status failed
+			json_set_meta pf_detail "$_pf_val_err"
+			return 2
+		fi
+		record_blocker "blocker: $PF_CONF syntax check failed: $_pf_val_err"
+		json_set_meta pf_status blocked
+		json_set_meta pf_detail "$_pf_val_err"
+		return 1
+	fi
+
+	# Snapshot pre-mutation state for exact changed booleans.
+	_ah_fl_live=$(sysctl -n net.pf.filter_local 2>/dev/null || printf '0')
+	_ah_fl_conf=0
+	if [ -f "$SYSCTL_CONF" ] && grep -Eq '^[[:space:]]*net\.pf\.filter_local[[:space:]]*=[[:space:]]*1([[:space:]]*(#.*)?)?$' "$SYSCTL_CONF"; then
+		_ah_fl_conf=1
+	fi
+	_ah_cur_pfload=$(sysrc -f "$LOADER_CONF" -qn pf_load 2>/dev/null || true)
+	_ah_pf_enabled=0
+	if pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+		_ah_pf_enabled=1
+	fi
+	_ah_dns_cur=$(detect_dns_bind_port)
+	_ah_dns_port=${_ah_dns_cur%%	*}
+	_ah_dns_file=${_ah_dns_cur#*	}
+	[ "$_ah_dns_port" != "$_ah_dns_cur" ] || _ah_dns_file=""
+	_ah_dns53=$(host_53_listener)
+
+	# 2. sysctl net.pf.filter_local=1 (live + /etc/sysctl.conf)
+	_ah_sysctl_changed=0
+	_ah_sysctl_live_changed=0
+	_ah_sysctl_err=""
+	if [ "$_ah_fl_conf" -eq 0 ]; then
+		HOST_MUTATED=1
+		set +e
+		append_sysctl_filter_local 2>"$_ah_work/sysctl.err"
+		_rc_sc=$?
+		set -e
+		if [ "$_rc_sc" -ne 0 ]; then
+			_ah_sysctl_err=$(cat "$_ah_work/sysctl.err" 2>/dev/null || printf 'failed writing sysctl.conf')
+			record_error "failed updating $SYSCTL_CONF: $_ah_sysctl_err"
+			json_set_meta sysctl_changed false
+			json_set_meta sysctl_status failed
+			json_set_meta sysctl_detail "$_ah_sysctl_err"
+			return 2
+		fi
+		_ah_sysctl_changed=1
+	fi
+	if [ "$_ah_fl_live" != "1" ]; then
+		HOST_MUTATED=1
+		set +e
+		_sc_out=$(sysctl net.pf.filter_local=1 2>&1 >/dev/null)
+		_rc_sl=$?
+		set -e
+		if [ "$_rc_sl" -ne 0 ]; then
+			record_error "failed setting sysctl net.pf.filter_local=1: $_sc_out"
+			json_set_meta sysctl_changed false
+			json_set_meta sysctl_status failed
+			json_set_meta sysctl_detail "$_sc_out"
+			return 2
+		fi
+		_ah_sysctl_changed=1
+		_ah_sysctl_live_changed=1
+	fi
+	if [ "$_ah_sysctl_changed" -eq 1 ]; then
+		json_set_meta changed true
+		json_set_meta sysctl_changed true
+		json_set_meta sysctl_status updated
+		say "  sysctl: configured net.pf.filter_local=1"
+	else
+		json_set_meta sysctl_changed false
+		json_set_meta sysctl_status unchanged
+		say "  sysctl: net.pf.filter_local=1 already set"
+	fi
+	json_set_meta sysctl_detail "net.pf.filter_local=1"
+
+	# 3. /boot/loader.conf pf_load="YES"
+	_ah_loader_changed=0
+	if [ "$_ah_cur_pfload" != "YES" ] && [ "$_ah_cur_pfload" != "yes" ]; then
+		HOST_MUTATED=1
+		mkdir -p "$(dirname "$LOADER_CONF")"
+		set +e
+		_ld_out=$(sysrc -f "$LOADER_CONF" pf_load=YES 2>&1 >/dev/null)
+		_rc_ld=$?
+		set -e
+		if [ "$_rc_ld" -ne 0 ]; then
+			record_error "failed setting pf_load=YES in $LOADER_CONF: $_ld_out"
+			json_set_meta loader_changed false
+			json_set_meta loader_status failed
+			json_set_meta loader_detail "$_ld_out"
+			return 2
+		fi
+		_ah_loader_changed=1
+		json_set_meta changed true
+		json_set_meta loader_changed true
+		json_set_meta loader_status updated
+		say "  loader: set pf_load=YES in $LOADER_CONF"
+	else
+		json_set_meta loader_changed false
+		json_set_meta loader_status unchanged
+		say "  loader: pf_load=YES already set in $LOADER_CONF"
+	fi
+	json_set_meta loader_detail "pf_load=YES in $LOADER_CONF"
+
+	# 4. pf.conf backup, update, enable, and load
+	_ah_pf_conf_changed=0
+	_ah_pf_enabled_now=0
+	_ah_pf_reloaded=0
+	case "$PF_MOD" in
+		UPDATED*)
+			HOST_MUTATED=1
+			if [ -f "$PF_CONF" ] && [ ! -f "$BEFORE_FJORD_PF" ] && [ ! -f "$STATE_DIR/pf.conf.pre-netavark" ]; then
+				mkdir -p "$STATE_DIR"
+				chmod 700 "$STATE_DIR"
+				cp "$PF_CONF" "$STATE_DIR/pf.conf.pre-netavark"
+			fi
+			cp "$_ah_work/pf.conf.new" "$PF_CONF"
+			_ah_pf_conf_changed=1
+			say "  pf: updated $PF_CONF (${PF_MOD#UPDATED	})"
+			;;
+	esac
+
+	if [ "$_ah_pf_enabled" -eq 0 ]; then
+		HOST_MUTATED=1
+		_cur_pfen=$(sysrc -qn pf_enable 2>/dev/null || true)
+		if [ "$_cur_pfen" != "YES" ] && [ "$_cur_pfen" != "yes" ]; then
+			sysrc pf_enable=YES >/dev/null
+		fi
+		set +e
+		_pfe_out=$(pfctl -e -f "$PF_CONF" 2>&1 >/dev/null)
+		_pfe_rc=$?
+		set -e
+		if [ "$_pfe_rc" -ne 0 ]; then
+			if ! pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+				record_error "failed enabling pf: $_pfe_out"
+				json_set_meta pf_changed false
+				json_set_meta pf_status failed
+				json_set_meta pf_detail "$_pfe_out"
+				return 2
+			fi
+			pfctl -f "$PF_CONF" >/dev/null
+		fi
+		_ah_pf_enabled_now=1
+		say "  pf: enabled pf and loaded $PF_CONF"
+	elif [ "$_ah_sysctl_live_changed" -eq 1 ]; then
+		HOST_MUTATED=1
+		pfctl -d >/dev/null 2>&1 || true
+		set +e
+		_pfe_out=$(pfctl -e -f "$PF_CONF" 2>&1 >/dev/null)
+		_pfe_rc=$?
+		set -e
+		if [ "$_pfe_rc" -ne 0 ]; then
+			record_error "failed reloading pf after net.pf.filter_local=1: $_pfe_out"
+			json_set_meta pf_changed false
+			json_set_meta pf_status failed
+			json_set_meta pf_detail "$_pfe_out"
+			return 2
+		fi
+		_ah_pf_reloaded=1
+		say "  pf: restarted pf for net.pf.filter_local=1"
+	elif [ "$_ah_pf_conf_changed" -eq 1 ] || ! pf_active_anchors_ok; then
+		HOST_MUTATED=1
+		set +e
+		_pfe_out=$(pfctl -f "$PF_CONF" 2>&1 >/dev/null)
+		_pfe_rc=$?
+		set -e
+		if [ "$_pfe_rc" -ne 0 ]; then
+			record_error "failed loading $PF_CONF: $_pfe_out"
+			json_set_meta pf_changed false
+			json_set_meta pf_status failed
+			json_set_meta pf_detail "$_pfe_out"
+			return 2
+		fi
+		_ah_pf_reloaded=1
+		[ "$_ah_pf_conf_changed" -eq 1 ] || say "  pf: loaded active netavark anchors from $PF_CONF"
+	fi
+
+	if [ "$_ah_pf_conf_changed" -eq 1 ] || [ "$_ah_pf_enabled_now" -eq 1 ] || [ "$_ah_pf_reloaded" -eq 1 ] || [ "$_ah_kld_loaded" -eq 0 ]; then
+		json_set_meta changed true
+		json_set_meta pf_changed true
+		if [ "$_ah_pf_conf_changed" -eq 1 ]; then
+			json_set_meta pf_status updated
+			json_set_meta pf_detail "added: ${PF_MOD#UPDATED	}"
+		elif [ "$_ah_pf_enabled_now" -eq 1 ]; then
+			json_set_meta pf_status enabled
+			json_set_meta pf_detail "enabled pf and loaded $PF_CONF"
+		else
+			json_set_meta pf_status reloaded
+			json_set_meta pf_detail "reloaded $PF_CONF"
+		fi
+	else
+		json_set_meta pf_changed false
+		json_set_meta pf_status unchanged
+		json_set_meta pf_detail "all netavark anchors present and active"
+		say "  pf: anchors already present and active"
+	fi
+
+	# 5. dns_bind_port when something holds *:53 and not already configured anywhere
+	if [ "$_ah_dns_port" -gt 0 ]; then
+		json_set_meta dns_changed false
+		json_set_meta dns_status already_set
+		json_set_meta dns_port "$_ah_dns_port"
+		json_set_meta dns_file "$_ah_dns_file"
+		say "  dns_bind_port: already configured ($_ah_dns_port in $_ah_dns_file)"
+	elif [ -n "$_ah_dns53" ]; then
+		HOST_MUTATED=1
+		_pick_port=$(free_dns_port)
+		mkdir -p "$(dirname "$DNS_CONF_DROPIN")"
+		cat > "$DNS_CONF_DROPIN" <<EOF
+[network]
+dns_bind_port = $_pick_port
+EOF
+		json_set_meta changed true
+		json_set_meta dns_changed true
+		json_set_meta dns_status updated
+		json_set_meta dns_port "$_pick_port"
+		json_set_meta dns_file "$DNS_CONF_DROPIN"
+		say "  dns_bind_port: wrote dns_bind_port = $_pick_port to $DNS_CONF_DROPIN (*:53 held by $_ah_dns53)"
+		if [ "$_ah_restart_svc" -eq 1 ] && service podman_service status >/dev/null 2>&1; then
+			_svc_now=$(service_backend_of)
+			_cli_now=$(backend_of)
+			if [ "$_svc_now" = "$_cli_now" ]; then
+				say "  restarting podman_service"
+				if ! service podman_service restart >/dev/null 2>&1; then
+					record_warn "failed to restart podman_service after writing $DNS_CONF_DROPIN"
+				fi
+			elif [ -n "$_svc_now" ]; then
+				record_warn "running podman_service uses '$_svc_now' while configuration selects '$_cli_now'; skipping service restart during 'host'"
+			fi
+		fi
+	else
+		json_set_meta dns_changed false
+		json_set_meta dns_status unchanged
+		json_set_meta dns_port "53"
+		json_set_meta dns_file ""
+		say "  dns_bind_port: *:53 is free (no override needed)"
+	fi
+
+	HOST_CHANGED=0
+	if [ "$_ah_sysctl_changed" -eq 1 ] || [ "$_ah_loader_changed" -eq 1 ] || \
+	   [ "$_ah_pf_conf_changed" -eq 1 ] || [ "$_ah_pf_enabled_now" -eq 1 ] || \
+	   [ "$_ah_pf_reloaded" -eq 1 ] || [ "$_ah_kld_loaded" -eq 0 ] || \
+	   { [ "$_ah_dns_port" -eq 0 ] && [ -n "$_ah_dns53" ]; }; then
+		HOST_CHANGED=1
+	fi
+	return 0
+}
+
 cmd_check() {
-	TMPD=$(mktemp -d /tmp/netavark-migrate-check.XXXXXX)
-	trap 'rm -rf "$TMPD"' EXIT
+	TMPD="$JSON_DIR/check"
+	mkdir -p "$TMPD"
 	set +e
 	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect" "$TMPD/stop_now"
 	rc=$?
 	set -e
 	if [ "$rc" -eq 2 ]; then
-		exit 0
+		finish_rc 0
 	fi
 	if [ "$rc" -eq 0 ] && [ "${SVC_MISMATCH:-0}" -eq 1 ]; then
-		exit 1
+		record_blocker "running podman_service uses '${SVC_BACKEND:-unknown}' while configuration selects '${BACKEND:-unknown}'; fix: service podman_service restart"
+		finish_rc 1
 	fi
-	exit "$rc"
+	if [ "$rc" -ne 0 ]; then
+		finish_rc 1
+	fi
+	finish_rc 0
+}
+
+cmd_host() {
+	require_root
+	TMPD="$JSON_DIR/host"
+	mkdir -p "$TMPD"
+
+	BE_BEFORE=$(backend_of)
+	SVC_BEFORE=$(service_backend_of)
+	json_set_meta backend_changed false
+	json_set_meta backend_from "$BE_BEFORE"
+	json_set_meta backend_to "$BE_BEFORE"
+	json_set_meta backend_service "$SVC_BEFORE"
+
+	say "== Host setup for netavark =="
+	if [ -n "$SVC_BEFORE" ] && [ "$SVC_BEFORE" != "$BE_BEFORE" ]; then
+		record_warn "running podman_service uses '$SVC_BEFORE' while configuration selects '$BE_BEFORE'"
+	fi
+
+	set +e
+	apply_host_setup "$TMPD" 1 1
+	_ah_rc=$?
+	set -e
+
+	SVC_AFTER=$(service_backend_of)
+	[ -n "$SVC_AFTER" ] && json_set_meta backend_service "$SVC_AFTER"
+
+	if [ "$_ah_rc" -eq 1 ]; then
+		err "host setup refused; host left unchanged"
+		finish_rc 1
+	elif [ "$_ah_rc" -ne 0 ]; then
+		err "host setup failed after modifying host state"
+		finish_rc 2
+	fi
+
+	if [ "$HOST_CHANGED" -eq 0 ]; then
+		say "Nothing changed: host is already configured for netavark."
+	else
+		say "Host setup complete."
+	fi
+	finish_rc 0
 }
 
 cmd_switch() {
 	require_root
-	TMPD=$(mktemp -d /tmp/netavark-migrate-run.XXXXXX)
-	trap 'rm -rf "$TMPD"' EXIT
+	TMPD="$JSON_DIR/switch"
+	mkdir -p "$TMPD"
 
 	set +e
 	run_preflight "$TMPD/create" "$TMPD/bridges" "$TMPD/running" "$TMPD/recreate" "$TMPD/inspect" "$TMPD/stop_now"
@@ -1150,14 +2165,17 @@ cmd_switch() {
 	set -e
 	if [ "$rc" -eq 2 ]; then
 		say "Nothing to do: already on netavark."
-		exit 0
+		finish_rc 0
 	elif [ "$rc" -ne 0 ]; then
 		err "preflight failed; host left unchanged"
-		exit 1
+		finish_rc 1
 	fi
 
 	say ""
 	say "== Migrating CNI -> netavark =="
+
+	HOST_MUTATED=1
+	json_set_meta changed true
 
 	mkdir -p "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
@@ -1168,9 +2186,8 @@ cmd_switch() {
 		cp "$TMPD/recreate" "$STATE_DIR/recreate-commands.sh"
 		chmod 700 "$STATE_DIR/recreate-commands.sh"
 	fi
-	if [ ! -f "$STATE_DIR/pf.conf.pre-netavark" ]; then
-		cp "$PF_CONF" "$STATE_DIR/pf.conf.pre-netavark"
-	fi
+
+	FAILURES=0
 
 	# 1. Stop running containers (under CNI on Podman 5, or pre-upgrade CNI / pre-PF jails on Podman 6).
 	if [ -s "$TMPD/stop_now" ]; then
@@ -1178,7 +2195,11 @@ cmd_switch() {
 		if [ "$PMAJOR" -lt 6 ]; then
 			say "  stopping running containers on CNI: $STOP_LIST"
 			# shellcheck disable=SC2086
-			pman stop -t 10 $STOP_LIST >/dev/null
+			if ! pman stop -t 10 $STOP_LIST >/dev/null 2>"$TMPD/stop.err"; then
+				_serr=$(cat "$TMPD/stop.err" 2>/dev/null || printf 'podman stop failed')
+				record_error "failed stopping running containers: $_serr"
+				FAILURES=$((FAILURES + 1))
+			fi
 		else
 			say "  stopping currently running containers: $STOP_LIST"
 			for _sc in $(cat "$TMPD/stop_now"); do
@@ -1200,11 +2221,20 @@ cmd_switch() {
 	if [ -d "$CNI_EPAIR_STATE_DIR" ]; then
 		for _ef in "$CNI_EPAIR_STATE_DIR"/*; do
 			[ -f "$_ef" ] || continue
-			_ep=$(cat "$_ef" 2>/dev/null || true)
-			if [ -n "$_ep" ] && ifconfig "$_ep" >/dev/null 2>&1; then
-				say "  destroying CNI epair $_ep"
-				ifconfig "$_ep" destroy 2>/dev/null || true
-			fi
+			case "$_ef" in
+				*.gw)
+					rm -f "$_ef"
+					continue
+					;;
+			esac
+			while read -r _c1 _c2; do
+				_ep="${_c2:-$_c1}"
+				[ -n "$_ep" ] || continue
+				if ifconfig "$_ep" >/dev/null 2>&1; then
+					say "  destroying CNI epair $_ep"
+					ifconfig "$_ep" destroy 2>/dev/null || true
+				fi
+			done < "$_ef"
 			rm -f "$_ef"
 		done
 	fi
@@ -1218,7 +2248,7 @@ cmd_switch() {
 	for br in $ALL_CNI_BRIDGES; do
 		if ifconfig "$br" >/dev/null 2>&1; then
 			say "  destroying CNI/stale bridge $br"
-			ifconfig "$br" destroy
+			ifconfig "$br" destroy 2>/dev/null || true
 		fi
 	done
 
@@ -1231,7 +2261,7 @@ cmd_switch() {
 		done
 	fi
 
-	# 4. Clear stale network_backend="cni" configs (on Podman 6), write drop-in, and confirm netavark backend.
+	# 4. Clear stale network_backend="cni" configs (on Podman 6) and write netavark backend drop-in.
 	if [ -n "$STALE_CNI_CONFS" ]; then
 		mkdir -p "$STATE_DIR/containers-conf.bak"
 		for _scf in $STALE_CNI_CONFS; do
@@ -1242,63 +2272,49 @@ cmd_switch() {
 		PODMAN_CONF_OVERRIDE=""
 	fi
 	mkdir -p "$(dirname "$CONF_DROPIN")"
-	if [ "${DNS_NEEDS_CFG:-0}" -eq 1 ]; then
-		cat > "$CONF_DROPIN" <<EOF
-[network]
-network_backend = "netavark"
-dns_bind_port = $DEFAULT_DNS_BIND_PORT
-EOF
-		say "  wrote $CONF_DROPIN (network_backend=netavark, dns_bind_port=$DEFAULT_DNS_BIND_PORT)"
-	else
-		cat > "$CONF_DROPIN" <<'EOF'
+	cat > "$CONF_DROPIN" <<'EOF'
 [network]
 network_backend = "netavark"
 EOF
-		say "  wrote $CONF_DROPIN (network_backend=netavark)"
+	say "  wrote $CONF_DROPIN (network_backend=netavark)"
+
+	# 5. Apply host setup (pf, filter_local, pf_load, dns_bind_port), forwarding, and restart podman_service.
+	set +e
+	apply_host_setup "$TMPD" 0 0
+	_hs_rc=$?
+	set -e
+	if [ "$_hs_rc" -ne 0 ]; then
+		FAILURES=$((FAILURES + 1))
+	fi
+
+	if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || printf 0)" != "1" ]; then
+		sysctl net.inet.ip.forwarding=1 >/dev/null || FAILURES=$((FAILURES + 1))
+	fi
+	if [ "$(sysrc -qn gateway_enable 2>/dev/null || true)" != "YES" ]; then
+		sysrc gateway_enable=YES >/dev/null || true
 	fi
 
 	if service podman_service status >/dev/null 2>&1; then
 		say "  restarting podman_service"
-		service podman_service restart >/dev/null
+		if ! service podman_service restart >/dev/null 2>&1; then
+			record_error "failed restarting podman_service"
+			FAILURES=$((FAILURES + 1))
+		fi
 	fi
 
 	NEW_BACKEND=$(backend_of)
+	SVC_AFTER=$(service_backend_of)
+	json_set_meta backend_to "$NEW_BACKEND"
+	json_set_meta backend_service "$SVC_AFTER"
+	if [ "$BACKEND" != "$NEW_BACKEND" ]; then
+		json_set_meta backend_changed true
+	fi
 	if [ "$NEW_BACKEND" != "netavark" ]; then
-		err "Podman reports backend '$NEW_BACKEND' instead of 'netavark'"
-		exit 1
-	fi
-
-	# 5. Configure sysctls and pf.conf for netavark.
-	if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || printf 0)" != "1" ]; then
-		sysctl net.inet.ip.forwarding=1 >/dev/null
-	fi
-	sysrc gateway_enable=YES >/dev/null
-	sysrc -f "$LOADER_CONF" pf_load=YES >/dev/null
-	if [ ! -f "$SYSCTL_CONF" ] || ! grep -q '^net\.pf\.filter_local=' "$SYSCTL_CONF"; then
-		printf '\nnet.pf.filter_local=1\n' >> "$SYSCTL_CONF"
-	fi
-
-	PF_MOD=$(run_lua pf update "$PF_CONF" "$TMPD/pf.conf.new")
-	case "$PF_MOD" in
-		UPDATED*)
-			pfctl -nf "$TMPD/pf.conf.new"
-			cp "$TMPD/pf.conf.new" "$PF_CONF"
-			say "  updated $PF_CONF (${PF_MOD#UPDATED	})"
-			;;
-	esac
-
-	FILTER_LOCAL=$(sysctl -n net.pf.filter_local 2>/dev/null || printf '0')
-	if [ "$FILTER_LOCAL" != "1" ]; then
-		sysctl net.pf.filter_local=1 >/dev/null
-		pfctl -d 2>/dev/null || true
-		pfctl -e -f "$PF_CONF"
-		say "  enabled net.pf.filter_local=1 and reloaded pf"
-	else
-		pfctl -f "$PF_CONF"
+		record_error "Podman reports backend '$NEW_BACKEND' instead of 'netavark'"
+		finish_rc 2
 	fi
 
 	# 6. Recreate custom networks under netavark.
-	FAILURES=0
 	if [ -s "$TMPD/create" ]; then
 		OLDIFS=$IFS
 		IFS='
@@ -1309,20 +2325,45 @@ EOF
 			net_kind=$(printf '%s' "$row" | cut -f2)
 			net_cmd=$(printf '%s' "$row" | cut -f3-)
 			say "  creating network $net_name ($net_kind)"
-			if ! eval "$net_cmd" >/dev/null; then
-				err "failed to create network $net_name"
+			set +e
+			_nc_err=$(eval "$net_cmd" 2>&1 >/dev/null)
+			_nc_rc=$?
+			set -e
+			if [ "$_nc_rc" -ne 0 ]; then
+				_nc_msg=$(printf '%s' "$_nc_err" | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
+				[ -n "$_nc_msg" ] || _nc_msg="podman network create exited $_nc_rc"
+				record_error "failed to create network $net_name: $_nc_msg"
+				json_add_net "$net_name" "" "$net_kind" "failed" "$_nc_msg"
 				FAILURES=$((FAILURES + 1))
+			else
+				json_add_net "$net_name" "" "$net_kind" "created" ""
 			fi
 		done
 		IFS=$OLDIFS
 	fi
 
-	# 7. Start containers in place.
-	if [ -s "$STATE_DIR/running-containers.txt" ]; then
+	# 7. Start containers in place unless --no-start was requested.
+	if [ "$NO_START" -eq 1 ]; then
+		say "  --no-start: leaving containers stopped for recreation"
+		if [ -s "$STATE_DIR/running-containers.txt" ]; then
+			for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+				json_add_list recreate "$cname"
+				say "  container $cname: needs recreating / starting under netavark"
+			done
+		fi
+	elif [ -s "$STATE_DIR/running-containers.txt" ]; then
 		for cname in $(cat "$STATE_DIR/running-containers.txt"); do
 			say "  starting container $cname"
-			if ! podman start "$cname" >/dev/null; then
-				err "failed to start container $cname (fallback run command in $STATE_DIR/recreate-commands.sh)"
+			set +e
+			_st_err=$(podman start "$cname" 2>&1 >/dev/null)
+			_st_rc=$?
+			set -e
+			if [ "$_st_rc" -ne 0 ]; then
+				_st_msg=$(printf '%s' "$_st_err" | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
+				[ -n "$_st_msg" ] || _st_msg="podman start exited $_st_rc"
+				record_error "failed to start container $cname: $_st_msg (fallback run command in $STATE_DIR/recreate-commands.sh)"
+				json_add_list failed_ctrs "$cname"
+				json_add_list recreate "$cname"
 				FAILURES=$((FAILURES + 1))
 			fi
 		done
@@ -1333,14 +2374,20 @@ EOF
 	say "  backend: $(backend_of)"
 	say "  net.pf.filter_local: $(sysctl -n net.pf.filter_local 2>/dev/null || printf unknown)"
 	say "  networks: $(podman network ls --format '{{.Name}}({{.Driver}})' | tr '\n' ' ')"
-	if [ -s "$STATE_DIR/running-containers.txt" ]; then
+	if [ "$NO_START" -eq 0 ] && [ -s "$STATE_DIR/running-containers.txt" ]; then
 		for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+			if grep -qxF "$cname" "$JSON_STATE/failed_ctrs.txt" 2>/dev/null; then
+				continue
+			fi
 			st=$(podman inspect --format '{{.State.Running}}' "$cname" 2>/dev/null || printf false)
-			jid=$(podman inspect --format '{{.State.Pid}}' "$cname" 2>/dev/null || printf '')
 			ips=""
 			if [ "$st" = "true" ]; then
 				ips=$(podman exec "$cname" ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" { printf "%s ", $2 }' || true)
+				json_add_list started "$cname"
 			else
+				record_error "container $cname is not running after start (state=$st)"
+				json_add_list failed_ctrs "$cname"
+				json_add_list recreate "$cname"
 				FAILURES=$((FAILURES + 1))
 			fi
 			say "  container $cname: running=$st ips=[${ips% }]"
@@ -1354,131 +2401,424 @@ EOF
 
 	if [ "$FAILURES" -gt 0 ]; then
 		err "completed with $FAILURES failure(s)"
-		exit 1
+		finish_rc 2
 	fi
 	say "Migration complete."
+	finish_rc 0
 }
 
 cmd_back() {
 	require_root
+	TMPD="$JSON_DIR/back"
+	mkdir -p "$TMPD"
+
+	PVER_B=$(podman_version)
+	BE_BEFORE=$(backend_of)
+	SVC_BEFORE=$(service_backend_of)
+	json_set_meta backend_changed false
+	json_set_meta backend_from "$BE_BEFORE"
+	json_set_meta backend_to "cni"
+	json_set_meta backend_service "$SVC_BEFORE"
+
 	if [ "$(podman_major)" -ge 6 ]; then
-		err "Podman $(podman_version) does not support the CNI backend; downgrade to Podman 5 before running 'netavark-migrate back'"
-		exit 1
+		json_set_meta backend_to "$BE_BEFORE"
+		record_blocker "Podman $PVER_B does not support the CNI backend; downgrade to Podman 5 before running 'netavark-migrate back'"
+		finish_rc 1
 	fi
-	if [ ! -d "$STATE_DIR" ]; then
-		err "no migration state found in $STATE_DIR"
-		exit 1
+
+	# Nothing to do if already cleanly on CNI with no netavark state/drop-in to revert.
+	_has_cni_bak=0
+	if [ -d "$STATE_DIR/cni-net.d" ] && [ -n "$(find "$STATE_DIR/cni-net.d" -maxdepth 1 -type f 2>/dev/null || true)" ]; then
+		_has_cni_bak=1
+	fi
+	_has_before_cni=0
+	if [ -d "$BEFORE_CNI_DIR" ] && [ -n "$(find "$BEFORE_CNI_DIR" -maxdepth 1 \( -name '*.conflist' -o -name '*.conf' \) 2>/dev/null || true)" ]; then
+		_has_before_cni=1
+	fi
+	_has_nv_nets=0
+	if [ -d "$NV_NET_DIR" ] && [ -n "$(find "$NV_NET_DIR" -maxdepth 1 -name '*.json' 2>/dev/null || true)" ]; then
+		_has_nv_nets=1
+	fi
+	_stale_nv=$(stale_backend_conf_files netavark)
+	if [ "$BE_BEFORE" = "cni" ] && { [ -z "$SVC_BEFORE" ] || [ "$SVC_BEFORE" = "cni" ]; } && \
+	   [ ! -f "$CONF_DROPIN" ] && [ -z "$_stale_nv" ] && \
+	   [ "$_has_cni_bak" -eq 0 ] && [ "$_has_before_cni" -eq 0 ] && [ "$_has_nv_nets" -eq 0 ]; then
+		say "Nothing to do: already on CNI."
+		finish_rc 0
 	fi
 
 	say "== Rolling back netavark -> CNI =="
+	BACK_TMP="$TMPD"
+	HOST_MUTATED=1
+	json_set_meta changed true
+
+	HAD_SWITCH_STATE=0
+	if [ -f "$STATE_DIR/running-containers.txt" ]; then
+		HAD_SWITCH_STATE=1
+	fi
+
 	CUR_RUNNING=$(podman ps --format '{{.Names}}' 2>/dev/null || true)
-	printf '%s\n' "$CUR_RUNNING" | sed '/^$/d' > "$STATE_DIR/running-containers-back.txt"
+	BACK_CIDS=$(podman ps -aq 2>/dev/null || true)
+	if [ -n "$BACK_CIDS" ]; then
+		podman ps -a --format '{{.Names}}	{{.Networks}}' > "$BACK_TMP/psnets" 2>/dev/null || : > "$BACK_TMP/psnets"
+		# shellcheck disable=SC2086
+		podman container inspect $BACK_CIDS > "$BACK_TMP/inspect.json" 2>/dev/null || : > "$BACK_TMP/inspect.json"
+		run_lua ctrnets "$BACK_TMP/inspect.json" "$BACK_TMP/psnets" > "$BACK_TMP/ctrnets.tsv"
+	else
+		: > "$BACK_TMP/ctrnets.tsv"
+	fi
+	if [ -f "$STATE_DIR/containers-inspect.json" ]; then
+		run_lua ctrnets "$STATE_DIR/containers-inspect.json" "" | cut -f1 > "$BACK_TMP/pre_switch_ctrs.txt"
+	else
+		: > "$BACK_TMP/pre_switch_ctrs.txt"
+	fi
+
+	FAILURES=0
 
 	# 1. Stop running containers under netavark so aardvark/pf teardown runs cleanly.
-	if [ -s "$STATE_DIR/running-containers-back.txt" ]; then
-		RUN_LIST=$(tr '\n' ' ' < "$STATE_DIR/running-containers-back.txt")
+	printf '%s\n' "$CUR_RUNNING" | sed '/^$/d' > "$BACK_TMP/running-back.txt"
+	if [ -s "$BACK_TMP/running-back.txt" ]; then
+		RUN_LIST=$(tr '\n' ' ' < "$BACK_TMP/running-back.txt")
 		say "  stopping running containers on netavark: $RUN_LIST"
 		# shellcheck disable=SC2086
-		podman stop -t 10 $RUN_LIST >/dev/null
+		if ! podman stop -t 10 $RUN_LIST >/dev/null 2>"$BACK_TMP/stop.err"; then
+			_serr=$(cat "$BACK_TMP/stop.err" 2>/dev/null || printf 'podman stop failed')
+			record_error "failed stopping running containers on netavark: $_serr"
+			FAILURES=$((FAILURES + 1))
+		fi
 	fi
 
 	# 2. Stop aardvark-dns and destroy netavark podman[0-9]* bridges.
 	pkill -x aardvark-dns 2>/dev/null || true
-	for br in $(ifconfig -l | tr ' ' '\n' | grep '^podman[0-9]'); do
+	for br in $(ifconfig -l | tr ' ' '\n' | grep '^podman[0-9]' || true); do
 		if ifconfig "$br" >/dev/null 2>&1; then
 			say "  destroying netavark bridge $br"
-			ifconfig "$br" destroy
+			ifconfig "$br" destroy 2>/dev/null || true
 		fi
 	done
 
-	# 3. Back up netavark network JSONs without `podman network rm` (which deletes or refuses containers).
+	# 3. Restore CNI conflists from $STATE_DIR/cni-net.d first, then ${CNI_DIR}.before-netavark
+	# (skipping any network name already present or restored).
+	RESTORED_CNI_NAMES=""
+	mkdir -p "$CNI_DIR"
+	for f in "$CNI_DIR"/*.conflist "$CNI_DIR"/*.conf; do
+		[ -f "$f" ] || continue
+		_n=$(run_lua jsonname "$f")
+		RESTORED_CNI_NAMES="${RESTORED_CNI_NAMES:+${RESTORED_CNI_NAMES},}$_n"
+	done
+	if [ -d "$STATE_DIR/cni-net.d" ]; then
+		for f in "$STATE_DIR/cni-net.d"/*; do
+			[ -f "$f" ] || continue
+			_n=$(run_lua jsonname "$f")
+			_b=$(basename "$f")
+			mv "$f" "$CNI_DIR/$_b"
+			if ! has_csv_token "$RESTORED_CNI_NAMES" "$_n"; then
+				RESTORED_CNI_NAMES="${RESTORED_CNI_NAMES:+${RESTORED_CNI_NAMES},}$_n"
+			fi
+			json_add_net "$_n" "netavark" "cni" "restored" ""
+			say "  restored CNI conflist $_b (network $_n)"
+		done
+	fi
+	if [ -d "$BEFORE_CNI_DIR" ]; then
+		for f in "$BEFORE_CNI_DIR"/*.conflist "$BEFORE_CNI_DIR"/*.conf; do
+			[ -f "$f" ] || continue
+			_n=$(run_lua jsonname "$f")
+			_b=$(basename "$f")
+			if has_csv_token "$RESTORED_CNI_NAMES" "$_n" || [ -e "$CNI_DIR/$_b" ]; then
+				if ! has_csv_token "$RESTORED_CNI_NAMES" "$_n"; then
+					json_add_net "$_n" "before-netavark" "cni" "skipped_duplicate" ""
+				fi
+				say "  skipping $_b from $BEFORE_CNI_DIR (network $_n already restored)"
+				continue
+			fi
+			mv "$f" "$CNI_DIR/$_b"
+			RESTORED_CNI_NAMES="${RESTORED_CNI_NAMES:+${RESTORED_CNI_NAMES},}$_n"
+			json_add_net "$_n" "before-netavark" "cni" "restored" ""
+			say "  restored CNI conflist $_b (network $_n) from $BEFORE_CNI_DIR"
+		done
+		rmdir "$BEFORE_CNI_DIR" 2>/dev/null || true
+	fi
+
+	# 4. Keep only netavark-only network JSONs (those without a CNI conflist to restore)
+	# in $STATE_DIR/netavark-networks.bak with their names unchanged for fjord carry-back.
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
 	rm -rf "$STATE_DIR/netavark-networks.bak"
 	mkdir -p "$STATE_DIR/netavark-networks.bak"
+	KEPT_NV_NETS=""
 	if [ -d "$NV_NET_DIR" ]; then
 		for j in "$NV_NET_DIR"/*.json; do
 			[ -f "$j" ] || continue
-			mv "$j" "$STATE_DIR/netavark-networks.bak/"
+			_n=$(run_lua jsonname "$j")
+			_fn=$(basename "$j")
+			if [ "$_n" = "podman" ] || has_csv_token "$RESTORED_CNI_NAMES" "$_n"; then
+				rm -f "$j"
+			else
+				mv "$j" "$STATE_DIR/netavark-networks.bak/$_fn"
+				KEPT_NV_NETS="${KEPT_NV_NETS}${KEPT_NV_NETS:+ }$_n"
+				json_add_list kept_nv "$_n"
+				json_add_net "$_n" "netavark" "netavark-networks.bak" "kept_for_recreate" ""
+			fi
 		done
 	fi
-
-	# 4. Restore CNI conflists and remove drop-in.
-	if [ -d "$STATE_DIR/cni-net.d" ]; then
-		mkdir -p "$CNI_DIR"
-		for f in "$STATE_DIR/cni-net.d"/*; do
-			[ -f "$f" ] || continue
-			mv "$f" "$CNI_DIR/"
-		done
+	if [ -n "$KEPT_NV_NETS" ]; then
+		say "  kept netavark networks without CNI conflists in $STATE_DIR/netavark-networks.bak: $KEPT_NV_NETS"
+	else
+		say "  kept netavark networks without CNI conflists: none"
 	fi
 
+	# 5. Remove drop-in / netavark backend overrides and confirm CNI backend.
 	rm -f "$CONF_DROPIN"
+	STALE_NV_CONFS=$(stale_backend_conf_files netavark)
+	if [ -n "$STALE_NV_CONFS" ]; then
+		mkdir -p "$STATE_DIR/containers-conf-back.bak"
+		for _nvcf in $STALE_NV_CONFS; do
+			cp "$_nvcf" "$STATE_DIR/containers-conf-back.bak/$(basename "$_nvcf")"
+			sed -i '' -E 's/^([[:space:]]*network_backend[[:space:]]*=[[:space:]]*"netavark".*)$/# \1 # disabled by netavark-migrate back/' "$_nvcf"
+			say "  commented out network_backend=\"netavark\" in $_nvcf"
+		done
+	fi
 	if service podman_service status >/dev/null 2>&1; then
 		say "  restarting podman_service"
-		service podman_service restart >/dev/null
+		if ! service podman_service restart >/dev/null 2>&1; then
+			record_error "failed restarting podman_service"
+			FAILURES=$((FAILURES + 1))
+		fi
 	fi
 
 	BACK=$(backend_of)
+	SVC_AFTER=$(service_backend_of)
+	json_set_meta backend_to "$BACK"
+	json_set_meta backend_service "$SVC_AFTER"
+	if [ "$BE_BEFORE" != "$BACK" ]; then
+		json_set_meta backend_changed true
+	fi
 	if [ "$BACK" != "cni" ]; then
-		err "expected backend 'cni' after removing $CONF_DROPIN, got '$BACK'"
-		exit 1
+		record_error "expected backend 'cni' after removing $CONF_DROPIN, got '$BACK'"
+		finish_rc 2
 	fi
 
-	# 5. Restart containers under CNI.
-	START_FILE="$STATE_DIR/running-containers-back.txt"
-	[ -s "$START_FILE" ] || START_FILE="$STATE_DIR/running-containers.txt"
-
-	FAILURES=0
-	if [ -s "$START_FILE" ]; then
-		for cname in $(cat "$START_FILE"); do
-			say "  starting container $cname on CNI"
-			if ! podman start "$cname" >/dev/null; then
-				err "failed to start container $cname on CNI"
-				FAILURES=$((FAILURES + 1))
+	# 6. Restart pre-switch CNI containers unless --no-start was given; otherwise only report recreation list.
+	STARTED_CTRS=""
+	RECREATE_CTRS=""
+	if [ "$NO_START" -eq 1 ]; then
+		say "  --no-start: leaving containers stopped for recreation"
+		if [ "$HAD_SWITCH_STATE" -eq 1 ]; then
+			cp "$BACK_TMP/running-back.txt" "$STATE_DIR/running-containers-back.txt"
+			START_FILE="$STATE_DIR/running-containers-back.txt"
+			[ -s "$START_FILE" ] || START_FILE="$STATE_DIR/running-containers.txt"
+			if [ -s "$START_FILE" ]; then
+				for cname in $(cat "$START_FILE"); do
+					case " $RECREATE_CTRS " in
+						*" $cname "*) continue ;;
+					esac
+					RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${cname}"
+					json_add_list recreate "$cname"
+				done
 			fi
-		done
+		fi
+		while IFS='	' read -r _acname _arun _acnets; do
+			[ -n "$_acname" ] || continue
+			case " $RECREATE_CTRS " in
+				*" $_acname "*) continue ;;
+			esac
+			_add_rec=0
+			if [ "$HAD_SWITCH_STATE" -eq 0 ]; then
+				_add_rec=1
+			else
+				for _kn in $KEPT_NV_NETS; do
+					if has_csv_token "$_acnets" "$_kn"; then
+						_add_rec=1
+						break
+					fi
+				done
+				if [ "$_add_rec" -eq 0 ] && ! grep -qxF "$_acname" "$BACK_TMP/pre_switch_ctrs.txt" 2>/dev/null; then
+					_add_rec=1
+				fi
+			fi
+			if [ "$_add_rec" -eq 1 ]; then
+				RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${_acname}"
+				json_add_list recreate "$_acname"
+			fi
+		done < "$BACK_TMP/ctrnets.tsv"
+	elif [ "$HAD_SWITCH_STATE" -eq 1 ]; then
+		cp "$BACK_TMP/running-back.txt" "$STATE_DIR/running-containers-back.txt"
+		START_FILE="$STATE_DIR/running-containers-back.txt"
+		[ -s "$START_FILE" ] || START_FILE="$STATE_DIR/running-containers.txt"
+		if [ -s "$START_FILE" ]; then
+			for cname in $(cat "$START_FILE"); do
+				_cnets=$(awk -F '\t' -v c="$cname" '$1 == c { print $3; exit }' "$BACK_TMP/ctrnets.tsv")
+				_uses_kept=0
+				for _kn in $KEPT_NV_NETS; do
+					if has_csv_token "$_cnets" "$_kn"; then
+						_uses_kept=1
+						break
+					fi
+				done
+				if [ "$_uses_kept" -eq 1 ]; then
+					say "  container $cname needs recreating on CNI (uses netavark-only network)"
+					RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${cname}"
+					json_add_list recreate "$cname"
+					continue
+				fi
+				say "  starting container $cname on CNI"
+				set +e
+				_bs_err=$(podman start "$cname" 2>&1 >/dev/null)
+				_bs_rc=$?
+				set -e
+				if [ "$_bs_rc" -eq 0 ]; then
+					STARTED_CTRS="${STARTED_CTRS}${STARTED_CTRS:+ }${cname}"
+				elif ! grep -qxF "$cname" "$BACK_TMP/pre_switch_ctrs.txt" 2>/dev/null; then
+					say "  container $cname needs recreating on CNI (created on netavark)"
+					RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${cname}"
+					json_add_list recreate "$cname"
+				else
+					_bs_msg=$(printf '%s' "$_bs_err" | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
+					[ -n "$_bs_msg" ] || _bs_msg="podman start exited $_bs_rc"
+					record_error "failed to start container $cname on CNI: $_bs_msg"
+					json_add_list failed_ctrs "$cname"
+					json_add_list recreate "$cname"
+					FAILURES=$((FAILURES + 1))
+				fi
+			done
+		fi
+		# Also report any remaining container attached to a kept netavark-only network.
+		while IFS='	' read -r _acname _arun _acnets; do
+			[ -n "$_acname" ] || continue
+			case " $RECREATE_CTRS " in
+				*" $_acname "*) continue ;;
+			esac
+			for _kn in $KEPT_NV_NETS; do
+				if has_csv_token "$_acnets" "$_kn"; then
+					say "  container $_acname needs recreating on CNI (uses netavark-only network $_kn)"
+					RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${_acname}"
+					json_add_list recreate "$_acname"
+					break
+				fi
+			done
+		done < "$BACK_TMP/ctrnets.tsv"
+	else
+		say "  no running-containers list in $STATE_DIR; restored networks and backend only"
+		while IFS='	' read -r _acname _arun _acnets; do
+			[ -n "$_acname" ] || continue
+			RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${_acname}"
+			json_add_list recreate "$_acname"
+		done < "$BACK_TMP/ctrnets.tsv"
 	fi
 
 	say ""
 	say "== Rollback verification =="
 	say "  backend: $(backend_of)"
 	say "  networks: $(podman network ls --format '{{.Name}}({{.Driver}})' | tr '\n' ' ')"
-	if [ -s "$START_FILE" ]; then
-		for cname in $(cat "$START_FILE"); do
+	say "  kept netavark networks ($STATE_DIR/netavark-networks.bak): ${KEPT_NV_NETS:-none}"
+	say "  containers needing recreation on CNI: ${RECREATE_CTRS:-none}"
+	if [ -n "$STARTED_CTRS" ]; then
+		for cname in $STARTED_CTRS; do
 			st=$(podman inspect --format '{{.State.Running}}' "$cname" 2>/dev/null || printf false)
 			ips=""
 			if [ "$st" = "true" ]; then
 				ips=$(podman exec "$cname" ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" { printf "%s ", $2 }' || true)
+				json_add_list started "$cname"
 			else
+				record_error "container $cname is not running after start on CNI (state=$st)"
+				json_add_list failed_ctrs "$cname"
+				json_add_list recreate "$cname"
 				FAILURES=$((FAILURES + 1))
 			fi
 			say "  container $cname: running=$st ips=[${ips% }]"
 		done
 	fi
-	say "  pre-migration pf.conf copy kept at $STATE_DIR/pf.conf.pre-netavark"
+	if [ -f "$BEFORE_FJORD_PF" ]; then
+		say "  pre-fjord pf.conf copy kept at $BEFORE_FJORD_PF"
+	elif [ -f "$STATE_DIR/pf.conf.pre-netavark" ]; then
+		say "  pre-migration pf.conf copy kept at $STATE_DIR/pf.conf.pre-netavark"
+	fi
 
 	if [ "$FAILURES" -gt 0 ]; then
 		err "rollback completed with $FAILURES failure(s)"
-		exit 1
+		finish_rc 2
 	fi
 	say "Rollback complete."
+	finish_rc 0
 }
 
-ACTION="${1:-switch}"
+ACTION=""
+ARG_ERR=""
+for _arg in "$@"; do
+	case "$_arg" in
+		--json)
+			JSON_MODE=1
+			;;
+		--no-start)
+			NO_START=1
+			;;
+		version|--version|-V)
+			if [ -n "$ACTION" ] && [ "$ACTION" != "version" ]; then
+				ARG_ERR="conflicting subcommands: $ACTION and $_arg"
+			else
+				ACTION="version"
+			fi
+			;;
+		-h|--help|help)
+			if [ -n "$ACTION" ] && [ "$ACTION" != "help" ]; then
+				ARG_ERR="conflicting subcommands: $ACTION and $_arg"
+			else
+				ACTION="help"
+			fi
+			;;
+		check|host|switch|back)
+			if [ -n "$ACTION" ] && [ "$ACTION" != "$_arg" ]; then
+				ARG_ERR="conflicting subcommands: $ACTION and $_arg"
+			else
+				ACTION="$_arg"
+			fi
+			;;
+		*)
+			ARG_ERR="unknown argument: $_arg"
+			;;
+	esac
+done
+
+[ -n "$ACTION" ] || ACTION="switch"
+
+if [ "$ACTION" = "version" ] && [ -z "$ARG_ERR" ] && [ "$NO_START" -eq 0 ]; then
+	printf 'netavark-migrate %s %s\n' "$INTERFACE_VERSION" "$INTERFACE_CAPS"
+	exit 0
+fi
+
+if [ "$ACTION" = "help" ] && [ -z "$ARG_ERR" ]; then
+	usage
+	exit 0
+fi
+
+if [ -z "$ARG_ERR" ] && [ "$NO_START" -eq 1 ] && [ "$ACTION" != "switch" ] && [ "$ACTION" != "back" ]; then
+	ARG_ERR="--no-start is only valid with switch or back"
+fi
+
+if [ "$JSON_MODE" -eq 1 ]; then
+	exec 3>&1 1>&2
+fi
+
+json_init
+trap 'cleanup_on_exit' EXIT
+
+if [ -n "$ARG_ERR" ]; then
+	record_blocker "$ARG_ERR"
+	usage >&2
+	finish_rc 1
+fi
+
 case "$ACTION" in
 	check)
 		cmd_check
+		;;
+	host)
+		cmd_host
 		;;
 	switch)
 		cmd_switch
 		;;
 	back)
 		cmd_back
-		;;
-	-h|--help|help)
-		usage
-		exit 0
-		;;
-	*)
-		usage >&2
-		exit 2
 		;;
 esac
