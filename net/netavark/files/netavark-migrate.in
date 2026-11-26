@@ -227,6 +227,66 @@ pman() {
 	fi
 }
 
+ctr_exists() {
+	pman container exists "$1" >/dev/null 2>&1
+}
+
+ctr_running() {
+	[ "$(pman inspect --format '{{.State.Running}}' "$1" 2>/dev/null || printf false)" = "true" ]
+}
+
+ctr_autoremove() {
+	[ "$(pman inspect --format '{{.HostConfig.AutoRemove}}' "$1" 2>/dev/null || printf false)" = "true" ]
+}
+
+stop_running_ctrs() {
+	_src_file="$1"
+	_src_err="$2"
+	_src_ctx="$3"
+	[ -s "$_src_file" ] || return 0
+	_src_list=$(tr '\n' ' ' < "$_src_file")
+	say "  stopping running containers $_src_ctx: $_src_list"
+	# shellcheck disable=SC2086
+	if pman stop -i -t 10 $_src_list >/dev/null 2>"$_src_err"; then
+		return 0
+	fi
+	_src_still=""
+	_src_last_err=$(cat "$_src_err" 2>/dev/null || printf '')
+	for _sc in $(cat "$_src_file"); do
+		ctr_exists "$_sc" || continue
+		ctr_running "$_sc" || continue
+		if ! pman stop -i -t 10 "$_sc" >/dev/null 2>"$_src_err"; then
+			if ctr_exists "$_sc" && ctr_running "$_sc"; then
+				_src_still="${_src_still}${_src_still:+ }$_sc"
+				_src_last_err=$(cat "$_src_err" 2>/dev/null || printf '')
+			fi
+		fi
+	done
+	if [ -n "$_src_still" ]; then
+		_src_msg=$(printf '%s' "$_src_last_err" | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
+		[ -n "$_src_msg" ] || _src_msg="podman stop failed"
+		record_error "failed stopping running containers $_src_ctx ($_src_still): $_src_msg"
+		FAILURES=$((FAILURES + 1))
+		return 1
+	fi
+	return 0
+}
+
+wait_autoremove_ctrs() {
+	_wac_file="$1"
+	[ -s "$_wac_file" ] || return 0
+	for _wc in $(cat "$_wac_file"); do
+		_wi=0
+		while [ "$_wi" -lt 30 ]; do
+			if ! ctr_exists "$_wc" || ctr_running "$_wc"; then
+				break
+			fi
+			sleep 0.1
+			_wi=$((_wi + 1))
+		done
+	done
+}
+
 podman_version() {
 	podman --version 2>/dev/null | awk '{print $3}'
 }
@@ -951,6 +1011,7 @@ local function exec_containers()
 	local stop_now_path = arg[8] or ""
 	local ps_nets_path = arg[9] or ""
 	local host_net_work = (tonumber(arg[10]) or 1) ~= 0
+	local autorm_path = arg[11] or ""
 	local ps_nets_by_name = read_ps_nets(ps_nets_path)
 	local text, rerr = read_file(inspect_path)
 	if not text or trim(text) == "" then
@@ -960,6 +1021,7 @@ local function exec_containers()
 	if type(arr) ~= "table" then error("inspect output is not an array") end
 
 	local stop_now_lines = {}
+	local autorm_lines = {}
 	local run_lines = {}
 	local rec_lines = { "#!/bin/sh", "# Captured pre-migration container run commands (fallback only)" }
 	local p6_work = 0
@@ -967,6 +1029,7 @@ local function exec_containers()
 	for _, c in ipairs(arr) do
 		local name = tostring(c.Name or "")
 		local is_running = (c.State and c.State.Running == true)
+		local auto_remove = (c.HostConfig and c.HostConfig.AutoRemove == true)
 		local err_str = tostring((c.State and c.State.Error) or "")
 		local stopped_by_user = (c.State and c.State.StoppedByUser == true)
 		local rp = tostring((c.HostConfig and c.HostConfig.RestartPolicy and c.HostConfig.RestartPolicy.Name) or "")
@@ -993,7 +1056,15 @@ local function exec_containers()
 
 		local state_label = is_running and "running" or "stopped"
 		local action = "keep stopped in place"
-		if pmajor < 6 then
+		if auto_remove then
+			if is_running then
+				action = "stop ephemeral (--rm) container"
+				stop_now_lines[#stop_now_lines + 1] = name
+				autorm_lines[#autorm_lines + 1] = name
+			else
+				action = "ignore stopped ephemeral (--rm) container"
+			end
+		elseif pmajor < 6 then
 			if is_running then
 				action = "stop on CNI -> carry over in place -> start on netavark"
 				stop_now_lines[#stop_now_lines + 1] = name
@@ -1033,12 +1104,14 @@ local function exec_containers()
 		print(string.format("CTR\t%s\t%s\t%s\t%s\t%s",
 			name, state_label, #nets > 0 and table.concat(nets, ",") or "none", note, action))
 
-		local cc = c.Config and c.Config.CreateCommand
-		if type(cc) == "table" and #cc > 0 then
-			local q = {}
-			for _, tok in ipairs(cc) do q[#q + 1] = sh_quote(tok) end
-			rec_lines[#rec_lines + 1] = "# " .. name
-			rec_lines[#rec_lines + 1] = table.concat(q, " ")
+		if not auto_remove then
+			local cc = c.Config and c.Config.CreateCommand
+			if type(cc) == "table" and #cc > 0 then
+				local q = {}
+				for _, tok in ipairs(cc) do q[#q + 1] = sh_quote(tok) end
+				rec_lines[#rec_lines + 1] = "# " .. name
+				rec_lines[#rec_lines + 1] = table.concat(q, " ")
+			end
 		end
 	end
 
@@ -1048,6 +1121,11 @@ local function exec_containers()
 		local sf = assert(io.open(stop_now_path, "w"))
 		if #stop_now_lines > 0 then sf:write(table.concat(stop_now_lines, "\n") .. "\n") end
 		sf:close()
+	end
+	if autorm_path ~= "" then
+		local af = assert(io.open(autorm_path, "w"))
+		if #autorm_lines > 0 then af:write(table.concat(autorm_lines, "\n") .. "\n") end
+		af:close()
 	end
 	if running_path ~= "" then
 		local rf = assert(io.open(running_path, "w"))
@@ -1352,9 +1430,10 @@ local function exec_ctrnets()
 	for _, c in ipairs(arr) do
 		local name = tostring(c.Name or "")
 		local is_running = (c.State and c.State.Running == true) and "true" or "false"
+		local auto_rm = (c.HostConfig and c.HostConfig.AutoRemove == true) and "true" or "false"
 		local nets = extract_ctr_nets(c, ps_nets_by_name)
 		table.sort(nets)
-		print(string.format("%s\t%s\t%s", name, is_running, table.concat(nets, ",")))
+		print(string.format("%s\t%s\t%s\t%s", name, is_running, table.concat(nets, ","), auto_rm))
 	end
 end
 
@@ -1514,6 +1593,7 @@ run_preflight() {
 	: > "$PLAN_RUN_FILE"
 	: > "$PLAN_RECREATE_FILE"
 	: > "$PLAN_STOP_NOW_FILE"
+	: > "$WORK_DIR/autorm"
 	PODMAN_CONF_OVERRIDE=""
 
 	say "== Host checks =="
@@ -1661,7 +1741,12 @@ EOF
 		IFACES=$(host_ifaces_csv)
 		VLAN_BRIDGES=$(vlanfilter_bridges_csv)
 		# shellcheck disable=SC2086
-		NET_PLAN=$(run_lua conflists "$EPAIR_NV_BIN" "$IFACES" "$VLAN_BRIDGES" "$NV_NETS_CSV" $CONFLIST_ARGS)
+		if ! NET_PLAN=$(run_lua conflists "$EPAIR_NV_BIN" "$IFACES" "$VLAN_BRIDGES" "$NV_NETS_CSV" $CONFLIST_ARGS 2>"$WORK_DIR/lua.err"); then
+			_le=$(cat "$WORK_DIR/lua.err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
+			record_blocker "failed planning CNI networks${_le:+: $_le}"
+			BLOCKERS=$((BLOCKERS + 1))
+			return 1
+		fi
 		OLDIFS=$IFS
 		IFS='
 '
@@ -1729,8 +1814,13 @@ EOF
 		PLAN_PSNETS_FILE="$WORK_DIR/psnets"
 		pman ps -a --format '{{.Names}}	{{.Networks}}' > "$PLAN_PSNETS_FILE" 2>/dev/null || : > "$PLAN_PSNETS_FILE"
 		# shellcheck disable=SC2086
-		pman container inspect $CIDS > "$PLAN_INSPECT_FILE"
-		CTR_PLAN=$(run_lua containers "$PLAN_INSPECT_FILE" "$PLAN_RUN_FILE" "$PLAN_RECREATE_FILE" "$PMAJOR" "$CNI_NETS_CSV" "$NV_NETS_CSV" "$PLAN_STOP_NOW_FILE" "$PLAN_PSNETS_FILE" "$HOST_NET_WORK")
+		pman container inspect $CIDS > "$PLAN_INSPECT_FILE" 2>/dev/null || true
+		if ! CTR_PLAN=$(run_lua containers "$PLAN_INSPECT_FILE" "$PLAN_RUN_FILE" "$PLAN_RECREATE_FILE" "$PMAJOR" "$CNI_NETS_CSV" "$NV_NETS_CSV" "$PLAN_STOP_NOW_FILE" "$PLAN_PSNETS_FILE" "$HOST_NET_WORK" "$WORK_DIR/autorm" 2>"$WORK_DIR/lua.err"); then
+			_le=$(cat "$WORK_DIR/lua.err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
+			record_blocker "failed parsing container inspect output${_le:+: $_le}"
+			BLOCKERS=$((BLOCKERS + 1))
+			return 1
+		fi
 		OLDIFS=$IFS
 		IFS='
 '
@@ -2191,21 +2281,18 @@ cmd_switch() {
 
 	# 1. Stop running containers (under CNI on Podman 5, or pre-upgrade CNI / pre-PF jails on Podman 6).
 	if [ -s "$TMPD/stop_now" ]; then
-		STOP_LIST=$(tr '\n' ' ' < "$TMPD/stop_now")
 		if [ "$PMAJOR" -lt 6 ]; then
-			say "  stopping running containers on CNI: $STOP_LIST"
-			# shellcheck disable=SC2086
-			if ! pman stop -t 10 $STOP_LIST >/dev/null 2>"$TMPD/stop.err"; then
-				_serr=$(cat "$TMPD/stop.err" 2>/dev/null || printf 'podman stop failed')
-				record_error "failed stopping running containers: $_serr"
-				FAILURES=$((FAILURES + 1))
-			fi
+			stop_running_ctrs "$TMPD/stop_now" "$TMPD/stop.err" "on CNI" || true
+			wait_autoremove_ctrs "$TMPD/autorm"
 		else
+			STOP_LIST=$(tr '\n' ' ' < "$TMPD/stop_now")
 			say "  stopping currently running containers: $STOP_LIST"
 			for _sc in $(cat "$TMPD/stop_now"); do
-				pman stop -t 10 "$_sc" >/dev/null 2>&1 || true
+				ctr_exists "$_sc" || continue
+				ctr_running "$_sc" || continue
+				pman stop -i -t 10 "$_sc" >/dev/null 2>&1 || true
 				# Fallback if pre-upgrade CNI network teardown failed after stopping or before stopping jail
-				if [ "$(pman inspect --format '{{.State.Running}}' "$_sc" 2>/dev/null || printf false)" = "true" ]; then
+				if ctr_running "$_sc"; then
 					_cid=$(pman inspect --format '{{.Id}}' "$_sc" 2>/dev/null || printf '')
 					if [ -n "$_cid" ]; then
 						pkill -f "$_cid" 2>/dev/null || true
@@ -2213,6 +2300,7 @@ cmd_switch() {
 					fi
 				fi
 			done
+			wait_autoremove_ctrs "$TMPD/autorm"
 		fi
 	fi
 
@@ -2347,18 +2435,21 @@ EOF
 		say "  --no-start: leaving containers stopped for recreation"
 		if [ -s "$STATE_DIR/running-containers.txt" ]; then
 			for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+				ctr_exists "$cname" || continue
 				json_add_list recreate "$cname"
 				say "  container $cname: needs recreating / starting under netavark"
 			done
 		fi
 	elif [ -s "$STATE_DIR/running-containers.txt" ]; then
 		for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+			ctr_exists "$cname" || continue
 			say "  starting container $cname"
 			set +e
 			_st_err=$(podman start "$cname" 2>&1 >/dev/null)
 			_st_rc=$?
 			set -e
 			if [ "$_st_rc" -ne 0 ]; then
+				ctr_exists "$cname" || continue
 				_st_msg=$(printf '%s' "$_st_err" | tr '\n' ' ' | sed 's/  */ /g; s/[[:space:]]*$//')
 				[ -n "$_st_msg" ] || _st_msg="podman start exited $_st_rc"
 				record_error "failed to start container $cname: $_st_msg (fallback run command in $STATE_DIR/recreate-commands.sh)"
@@ -2376,6 +2467,7 @@ EOF
 	say "  networks: $(podman network ls --format '{{.Name}}({{.Driver}})' | tr '\n' ' ')"
 	if [ "$NO_START" -eq 0 ] && [ -s "$STATE_DIR/running-containers.txt" ]; then
 		for cname in $(cat "$STATE_DIR/running-containers.txt"); do
+			ctr_exists "$cname" || continue
 			if grep -qxF "$cname" "$JSON_STATE/failed_ctrs.txt" 2>/dev/null; then
 				continue
 			fi
@@ -2462,7 +2554,7 @@ cmd_back() {
 	if [ -n "$BACK_CIDS" ]; then
 		podman ps -a --format '{{.Names}}	{{.Networks}}' > "$BACK_TMP/psnets" 2>/dev/null || : > "$BACK_TMP/psnets"
 		# shellcheck disable=SC2086
-		podman container inspect $BACK_CIDS > "$BACK_TMP/inspect.json" 2>/dev/null || : > "$BACK_TMP/inspect.json"
+		podman container inspect $BACK_CIDS > "$BACK_TMP/inspect.json" 2>/dev/null || true
 		run_lua ctrnets "$BACK_TMP/inspect.json" "$BACK_TMP/psnets" > "$BACK_TMP/ctrnets.tsv"
 	else
 		: > "$BACK_TMP/ctrnets.tsv"
@@ -2476,16 +2568,24 @@ cmd_back() {
 	FAILURES=0
 
 	# 1. Stop running containers under netavark so aardvark/pf teardown runs cleanly.
-	printf '%s\n' "$CUR_RUNNING" | sed '/^$/d' > "$BACK_TMP/running-back.txt"
-	if [ -s "$BACK_TMP/running-back.txt" ]; then
-		RUN_LIST=$(tr '\n' ' ' < "$BACK_TMP/running-back.txt")
-		say "  stopping running containers on netavark: $RUN_LIST"
-		# shellcheck disable=SC2086
-		if ! podman stop -t 10 $RUN_LIST >/dev/null 2>"$BACK_TMP/stop.err"; then
-			_serr=$(cat "$BACK_TMP/stop.err" 2>/dev/null || printf 'podman stop failed')
-			record_error "failed stopping running containers on netavark: $_serr"
-			FAILURES=$((FAILURES + 1))
-		fi
+	printf '%s\n' "$CUR_RUNNING" | sed '/^$/d' > "$BACK_TMP/running-back-raw.txt"
+	awk -F '\t' '$4 == "true" { print $1 }' "$BACK_TMP/ctrnets.tsv" > "$BACK_TMP/autorm.txt"
+	if [ -s "$BACK_TMP/running-back-raw.txt" ]; then
+		for _rbc in $(cat "$BACK_TMP/running-back-raw.txt"); do
+			if ! grep -qxF "$_rbc" "$BACK_TMP/autorm.txt" 2>/dev/null && ctr_autoremove "$_rbc"; then
+				printf '%s\n' "$_rbc" >> "$BACK_TMP/autorm.txt"
+			fi
+		done
+	fi
+	stop_running_ctrs "$BACK_TMP/running-back-raw.txt" "$BACK_TMP/stop.err" "on netavark" || true
+	wait_autoremove_ctrs "$BACK_TMP/autorm.txt"
+	: > "$BACK_TMP/running-back.txt"
+	if [ -s "$BACK_TMP/running-back-raw.txt" ]; then
+		for _rbc in $(cat "$BACK_TMP/running-back-raw.txt"); do
+			grep -qxF "$_rbc" "$BACK_TMP/autorm.txt" 2>/dev/null && continue
+			ctr_exists "$_rbc" || continue
+			printf '%s\n' "$_rbc" >> "$BACK_TMP/running-back.txt"
+		done
 	fi
 
 	# 2. Stop aardvark-dns and destroy netavark podman[0-9]* bridges.
@@ -2609,6 +2709,8 @@ cmd_back() {
 			[ -s "$START_FILE" ] || START_FILE="$STATE_DIR/running-containers.txt"
 			if [ -s "$START_FILE" ]; then
 				for cname in $(cat "$START_FILE"); do
+					grep -qxF "$cname" "$BACK_TMP/autorm.txt" 2>/dev/null && continue
+					ctr_exists "$cname" || continue
 					case " $RECREATE_CTRS " in
 						*" $cname "*) continue ;;
 					esac
@@ -2617,8 +2719,10 @@ cmd_back() {
 				done
 			fi
 		fi
-		while IFS='	' read -r _acname _arun _acnets; do
+		while IFS='	' read -r _acname _arun _acnets _aautorm; do
 			[ -n "$_acname" ] || continue
+			[ "$_aautorm" = "true" ] && continue
+			ctr_exists "$_acname" || continue
 			case " $RECREATE_CTRS " in
 				*" $_acname "*) continue ;;
 			esac
@@ -2647,6 +2751,8 @@ cmd_back() {
 		[ -s "$START_FILE" ] || START_FILE="$STATE_DIR/running-containers.txt"
 		if [ -s "$START_FILE" ]; then
 			for cname in $(cat "$START_FILE"); do
+				grep -qxF "$cname" "$BACK_TMP/autorm.txt" 2>/dev/null && continue
+				ctr_exists "$cname" || continue
 				_cnets=$(awk -F '\t' -v c="$cname" '$1 == c { print $3; exit }' "$BACK_TMP/ctrnets.tsv")
 				_uses_kept=0
 				for _kn in $KEPT_NV_NETS; do
@@ -2668,6 +2774,8 @@ cmd_back() {
 				set -e
 				if [ "$_bs_rc" -eq 0 ]; then
 					STARTED_CTRS="${STARTED_CTRS}${STARTED_CTRS:+ }${cname}"
+				elif ! ctr_exists "$cname"; then
+					continue
 				elif ! grep -qxF "$cname" "$BACK_TMP/pre_switch_ctrs.txt" 2>/dev/null; then
 					say "  container $cname needs recreating on CNI (created on netavark)"
 					RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${cname}"
@@ -2683,8 +2791,10 @@ cmd_back() {
 			done
 		fi
 		# Also report any remaining container attached to a kept netavark-only network.
-		while IFS='	' read -r _acname _arun _acnets; do
+		while IFS='	' read -r _acname _arun _acnets _aautorm; do
 			[ -n "$_acname" ] || continue
+			[ "$_aautorm" = "true" ] && continue
+			ctr_exists "$_acname" || continue
 			case " $RECREATE_CTRS " in
 				*" $_acname "*) continue ;;
 			esac
@@ -2699,8 +2809,10 @@ cmd_back() {
 		done < "$BACK_TMP/ctrnets.tsv"
 	else
 		say "  no running-containers list in $STATE_DIR; restored networks and backend only"
-		while IFS='	' read -r _acname _arun _acnets; do
+		while IFS='	' read -r _acname _arun _acnets _aautorm; do
 			[ -n "$_acname" ] || continue
+			[ "$_aautorm" = "true" ] && continue
+			ctr_exists "$_acname" || continue
 			RECREATE_CTRS="${RECREATE_CTRS}${RECREATE_CTRS:+ }${_acname}"
 			json_add_list recreate "$_acname"
 		done < "$BACK_TMP/ctrnets.tsv"
@@ -2714,6 +2826,7 @@ cmd_back() {
 	say "  containers needing recreation on CNI: ${RECREATE_CTRS:-none}"
 	if [ -n "$STARTED_CTRS" ]; then
 		for cname in $STARTED_CTRS; do
+			ctr_exists "$cname" || continue
 			st=$(podman inspect --format '{{.State.Running}}' "$cname" 2>/dev/null || printf false)
 			ips=""
 			if [ "$st" = "true" ]; then
